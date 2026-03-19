@@ -1,0 +1,78 @@
+from RevitMCP_ExternalServer.providers.anthropic_provider import run_anthropic_chat
+from RevitMCP_ExternalServer.providers.google_provider import run_google_chat
+from RevitMCP_ExternalServer.providers.openai_provider import run_openai_chat
+from RevitMCP_ExternalServer.providers.types import ProviderResult
+from RevitMCP_ExternalServer.tools.planning_tools import build_planning_system_prompt
+
+
+def run_chat_request(
+    services,
+    tool_registry,
+    request_data: dict,
+    openai_client_factory=None,
+    anthropic_client_factory=None,
+    genai_module=None,
+    types_module=None,
+):
+    data = request_data or {}
+    conversation_history = data.get("conversation") or []
+    api_key = data.get("apiKey")
+    selected_model_ui_name = data.get("model") or ""
+    planning_system_prompt = build_planning_system_prompt(tool_registry)
+
+    execute_tool_call = lambda tool_name, function_args: tool_registry.dispatch(services, tool_name, function_args)
+
+    if selected_model_ui_name == "echo_model":
+        last_user_message = conversation_history[-1]["content"] if conversation_history else ""
+        provider_result = ProviderResult(reply=f"Echo: {last_user_message}")
+    elif selected_model_ui_name.startswith("gpt-") or selected_model_ui_name.startswith("o"):
+        provider_result = run_openai_chat(
+            conversation_history=conversation_history,
+            system_prompt=planning_system_prompt,
+            model_id=selected_model_ui_name,
+            api_key=api_key,
+            tool_specs=tool_registry.to_openai_tools(),
+            execute_tool_call=execute_tool_call,
+            logger=services.logger,
+            max_tool_iterations=services.config.max_tool_iterations,
+            client_factory=openai_client_factory,
+        )
+    elif selected_model_ui_name.startswith("claude-"):
+        actual_model_id = services.config.anthropic_model_id_map.get(selected_model_ui_name, selected_model_ui_name)
+        provider_result = run_anthropic_chat(
+            conversation_history=conversation_history,
+            system_prompt=planning_system_prompt,
+            model_id=actual_model_id,
+            api_key=api_key,
+            tool_specs=tool_registry.to_anthropic_tools(),
+            execute_tool_call=execute_tool_call,
+            logger=services.logger,
+            max_tool_iterations=services.config.max_tool_iterations,
+            client_factory=anthropic_client_factory,
+        )
+    elif selected_model_ui_name.startswith("gemini-"):
+        provider_result = run_google_chat(
+            conversation_history=conversation_history,
+            system_prompt=planning_system_prompt,
+            model_id=selected_model_ui_name,
+            api_key=api_key,
+            tool_specs=tool_registry.to_google_tools(),
+            execute_tool_call=execute_tool_call,
+            logger=services.logger,
+            max_tool_iterations=services.config.max_tool_iterations,
+            genai_module=genai_module,
+            types_module=types_module,
+        )
+    else:
+        provider_result = ProviderResult(
+            reply="",
+            error_detail="Model '{}' is not recognized or supported.".format(selected_model_ui_name),
+        )
+
+    response_payload = {"reply": provider_result.reply}
+    if provider_result.error_detail and not provider_result.reply:
+        return {"error": provider_result.error_detail}, 500
+    if provider_result.error_detail:
+        response_payload["error_detail"] = provider_result.error_detail
+    return response_payload, 200
+
