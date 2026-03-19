@@ -156,8 +156,383 @@ def _normalize_element_ids(raw_ids):
     return valid_ids, requested_count, invalid_ids
 
 
+def _normalize_category_key(value):
+    return str(value or "").strip().lower().replace("ost_", "").replace(" ", "")
+
+
+def _get_element_identity(element, doc):
+    family_name = "Not available"
+    type_name = "Not available"
+
+    try:
+        symbol = getattr(element, "Symbol", None)
+    except Exception:
+        symbol = None
+
+    try:
+        if not symbol and doc and hasattr(element, "GetTypeId"):
+            type_id = element.GetTypeId()
+            if type_id and type_id != DB.ElementId.InvalidElementId:
+                symbol = doc.GetElement(type_id)
+    except Exception:
+        symbol = symbol if symbol else None
+
+    try:
+        if symbol:
+            if hasattr(symbol, "Name") and symbol.Name:
+                type_name = symbol.Name
+            family = getattr(symbol, "Family", None)
+            if family and hasattr(family, "Name") and family.Name:
+                family_name = family.Name
+    except Exception:
+        pass
+
+    display_name = None
+    try:
+        display_name = getattr(element, "Name", None)
+    except Exception:
+        display_name = None
+
+    if not display_name:
+        if type_name != "Not available":
+            display_name = type_name
+        else:
+            display_name = str(element.Id.IntegerValue)
+
+    return display_name, family_name, type_name
+
+
+def _build_element_summary(element, doc):
+    category_name = "No Category"
+    try:
+        if element.Category and element.Category.Name:
+            category_name = element.Category.Name
+    except Exception:
+        pass
+
+    display_name, family_name, type_name = _get_element_identity(element, doc)
+
+    summary = {
+        "element_id": str(element.Id.IntegerValue),
+        "name": display_name,
+        "category": category_name
+    }
+
+    if family_name != "Not available":
+        summary["family_name"] = family_name
+    if type_name != "Not available":
+        summary["type_name"] = type_name
+    if family_name != "Not available" and type_name != "Not available":
+        summary["family_and_type"] = "{} : {}".format(family_name, type_name)
+
+    try:
+        summary["class_name"] = element.GetType().Name
+    except Exception:
+        pass
+
+    return summary
+
+
 def register_routes(api):
     """Register all element-related routes with the API"""
+
+    @api.route('/views/active/info', methods=['GET'])
+    def handle_get_active_view_info(request):
+        route_logger = script.get_logger()
+
+        try:
+            current_uiapp = __revit__
+            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
+                return routes.Response(status=503, data={"error": "No active UI document"})
+
+            uidoc = current_uiapp.ActiveUIDocument
+            doc = uidoc.Document
+            active_view = uidoc.ActiveView
+
+            if not active_view:
+                return routes.Response(status=503, data={"error": "No active Revit view"})
+
+            associated_level = None
+            try:
+                gen_level = getattr(active_view, "GenLevel", None)
+                if gen_level and hasattr(gen_level, "Name") and gen_level.Name:
+                    associated_level = gen_level.Name
+            except Exception:
+                associated_level = None
+
+            if not associated_level:
+                try:
+                    level_id = getattr(active_view, "LevelId", DB.ElementId.InvalidElementId)
+                    if level_id and level_id != DB.ElementId.InvalidElementId:
+                        level = doc.GetElement(level_id)
+                        if level and hasattr(level, "Name") and level.Name:
+                            associated_level = level.Name
+                except Exception:
+                    associated_level = None
+
+            view_info = {
+                "id": str(active_view.Id.IntegerValue),
+                "name": active_view.Name,
+                "type": str(active_view.ViewType),
+                "scale": int(getattr(active_view, "Scale", 0) or 0),
+                "is_template": bool(getattr(active_view, "IsTemplate", False)),
+                "can_be_printed": bool(getattr(active_view, "CanBePrinted", False))
+            }
+
+            if associated_level:
+                view_info["associated_level"] = associated_level
+
+            try:
+                view_family = getattr(active_view, "ViewFamily", None)
+                if view_family is not None:
+                    view_info["family"] = str(view_family)
+            except Exception:
+                pass
+
+            try:
+                detail_level = getattr(active_view, "DetailLevel", None)
+                if detail_level is not None:
+                    view_info["detail_level"] = str(detail_level)
+            except Exception:
+                pass
+
+            try:
+                display_style = getattr(active_view, "DisplayStyle", None)
+                if display_style is not None:
+                    view_info["display_style"] = str(display_style)
+            except Exception:
+                pass
+
+            return {
+                "status": "success",
+                "message": "Retrieved active view metadata.",
+                "doc": {
+                    "title": doc.Title,
+                    "path": doc.PathName
+                },
+                "view": view_info
+            }
+
+        except Exception as e:
+            route_logger.critical("Error in /views/active/info: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/views/active/elements', methods=['POST'])
+    def handle_get_active_view_elements(request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else {}
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+            category_names = payload.get('category_names', []) or []
+            if isinstance(category_names, str):
+                category_names = [category_names]
+            elif not isinstance(category_names, list):
+                return routes.Response(status=400, data={"error": "'category_names' must be a list of strings"})
+
+            try:
+                limit = int(payload.get('limit', 200))
+            except Exception:
+                limit = 200
+            limit = max(1, min(2000, limit))
+
+            requested_categories = [_normalize_category_key(name) for name in category_names if str(name or "").strip()]
+
+            current_uiapp = __revit__
+            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
+                return routes.Response(status=503, data={"error": "No active UI document"})
+
+            uidoc = current_uiapp.ActiveUIDocument
+            doc = uidoc.Document
+            active_view = uidoc.ActiveView
+
+            collector = DB.FilteredElementCollector(doc, active_view.Id).WhereElementIsNotElementType()
+
+            element_ids = []
+            elements = []
+            total_count = 0
+
+            for element in collector:
+                try:
+                    category_name = element.Category.Name if element.Category and element.Category.Name else ""
+                except Exception:
+                    category_name = ""
+
+                if requested_categories and _normalize_category_key(category_name) not in requested_categories:
+                    continue
+
+                total_count += 1
+                if len(element_ids) >= limit:
+                    continue
+
+                element_ids.append(str(element.Id.IntegerValue))
+                elements.append(_build_element_summary(element, doc))
+
+            return {
+                "status": "success",
+                "message": "Found {} matching elements in the active view.".format(total_count),
+                "view": {
+                    "id": str(active_view.Id.IntegerValue),
+                    "name": active_view.Name,
+                    "type": str(active_view.ViewType)
+                },
+                "category_filters": category_names,
+                "limit": limit,
+                "total_count": total_count,
+                "returned_count": len(element_ids),
+                "truncated": total_count > len(element_ids),
+                "element_ids": element_ids,
+                "elements": elements
+            }
+
+        except Exception as e:
+            route_logger.critical("Error in /views/active/elements: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/selection/active', methods=['POST'])
+    def handle_get_active_selection(request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else {}
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+            try:
+                limit = int(payload.get('limit', 200))
+            except Exception:
+                limit = 200
+            limit = max(1, min(2000, limit))
+
+            current_uiapp = __revit__
+            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
+                return routes.Response(status=503, data={"error": "No active UI document"})
+
+            uidoc = current_uiapp.ActiveUIDocument
+            doc = uidoc.Document
+            selected_ids = uidoc.Selection.GetElementIds()
+
+            element_ids = []
+            elements = []
+            total_count = 0
+
+            for elem_id in selected_ids:
+                total_count += 1
+                if len(element_ids) >= limit:
+                    continue
+
+                element = doc.GetElement(elem_id)
+                if not element:
+                    continue
+
+                element_ids.append(str(elem_id.IntegerValue))
+                elements.append(_build_element_summary(element, doc))
+
+            return {
+                "status": "success",
+                "message": "Read {} elements from the current Revit selection.".format(total_count),
+                "limit": limit,
+                "total_count": total_count,
+                "returned_count": len(element_ids),
+                "truncated": total_count > len(element_ids),
+                "element_ids": element_ids,
+                "elements": elements
+            }
+
+        except Exception as e:
+            route_logger.critical("Error in /selection/active: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/families/types', methods=['POST'])
+    def handle_list_family_types(request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else {}
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+            category_names = payload.get('category_names', []) or []
+            if isinstance(category_names, str):
+                category_names = [category_names]
+            elif not isinstance(category_names, list):
+                return routes.Response(status=400, data={"error": "'category_names' must be a list of strings"})
+
+            family_name_contains = str(payload.get('family_name_contains') or "").strip().lower()
+            type_name_contains = str(payload.get('type_name_contains') or "").strip().lower()
+
+            try:
+                limit = int(payload.get('limit', 150))
+            except Exception:
+                limit = 150
+            limit = max(1, min(2000, limit))
+
+            requested_categories = [_normalize_category_key(name) for name in category_names if str(name or "").strip()]
+
+            current_uiapp = __revit__
+            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
+                return routes.Response(status=503, data={"error": "No active UI document"})
+
+            doc = current_uiapp.ActiveUIDocument.Document
+            symbols = DB.FilteredElementCollector(doc).OfClass(DB.FamilySymbol).ToElements()
+
+            family_types = []
+            total_count = 0
+
+            for symbol in symbols:
+                try:
+                    family = getattr(symbol, "Family", None)
+                    family_name = family.Name if family and hasattr(family, "Name") and family.Name else ""
+                    type_name = symbol.Name if hasattr(symbol, "Name") and symbol.Name else ""
+                    category = getattr(symbol, "Category", None)
+                    category_name = category.Name if category and hasattr(category, "Name") and category.Name else ""
+
+                    if requested_categories and _normalize_category_key(category_name) not in requested_categories:
+                        continue
+                    if family_name_contains and family_name_contains not in family_name.lower():
+                        continue
+                    if type_name_contains and type_name_contains not in type_name.lower():
+                        continue
+
+                    total_count += 1
+                    if len(family_types) >= limit:
+                        continue
+
+                    family_types.append({
+                        "symbol_id": str(symbol.Id.IntegerValue),
+                        "category": category_name or "No Category",
+                        "family_name": family_name or "Unnamed Family",
+                        "type_name": type_name or "Unnamed Type",
+                        "family_and_type": "{} : {}".format(family_name or "Unnamed Family", type_name or "Unnamed Type"),
+                        "is_active": bool(getattr(symbol, "IsActive", False))
+                    })
+                except Exception:
+                    continue
+
+            return {
+                "status": "success",
+                "message": "Matched {} family types in the current document.".format(total_count),
+                "category_filters": category_names,
+                "family_name_contains": payload.get('family_name_contains'),
+                "type_name_contains": payload.get('type_name_contains'),
+                "limit": limit,
+                "total_count": total_count,
+                "returned_count": len(family_types),
+                "truncated": total_count > len(family_types),
+                "family_types": family_types
+            }
+
+        except Exception as e:
+            route_logger.critical("Error in /families/types: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
 
     @api.route('/get_elements_by_category', methods=['POST'])
     def handle_get_elements_by_category(request):
