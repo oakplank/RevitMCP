@@ -12,13 +12,17 @@ RevitMCP (Revit Model Content Protocol) is a pyRevit extension that allows exter
 - **Sheet and view tooling:** List placeable views, auto-create sheets, and place views with smart numbering
 - **AI-native operation:** Available through both the local web UI and the MCP stdio surface for desktop AI assistants
 
-## MCP Tool Catalog
+## Supported Tools
 
-The current RevitMCP server exposes the following user-facing tools:
+RevitMCP currently exposes these 20 MCP tools:
 
 | Tool | Description |
 | --- | --- |
 | `get_revit_project_info` | Get active project metadata, document path, and Revit version details |
+| `get_active_view_info` | Read the current view's name, type, scale, and related metadata |
+| `get_active_view_elements` | Capture a bounded snapshot of elements visible in the active view |
+| `get_active_selection` | Read the current Revit selection as a reusable result set |
+| `list_family_types` | List loaded family types with category, family, type, and symbol IDs |
 | `get_revit_schema_context` | Load canonical Revit schema context including levels, categories, families, types, and common parameters |
 | `resolve_revit_targets` | Resolve user terms to exact Revit category, level, family, type, and parameter names |
 | `get_elements_by_category` | Retrieve all elements for a category and store the result for follow-on actions |
