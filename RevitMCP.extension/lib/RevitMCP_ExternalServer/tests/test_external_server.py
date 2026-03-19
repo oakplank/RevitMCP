@@ -58,6 +58,16 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(len(google_specs), 1)
         self.assertEqual(len(google_specs[0].function_declarations), len(definitions))
 
+        definition_map = {definition.name: definition for definition in definitions}
+        filter_parameters = definition_map["filter_elements"].json_schema["properties"]["parameters"]["items"]["properties"]
+        filter_operator_enum = filter_parameters["operator"]["enum"]
+        stored_operator_enum = definition_map["filter_stored_elements_by_parameter"].json_schema["properties"]["operator"]["enum"]
+
+        self.assertIn("greater_than", filter_operator_enum)
+        self.assertIn("greater_than_or_equal", filter_operator_enum)
+        self.assertIn("less_than_or_equal", filter_operator_enum)
+        self.assertEqual(filter_operator_enum, stored_operator_enum)
+
     def test_dispatch_known_and_unknown_tool(self):
         app, _mcp_server, services, registry = create_application(
             launch_background_tasks=False,

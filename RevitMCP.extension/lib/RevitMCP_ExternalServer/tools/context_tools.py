@@ -309,7 +309,8 @@ def build_context_tools() -> list[ToolDefinition]:
             name=RESOLVE_TARGETS_TOOL_NAME,
             description=(
                 "Resolves user terms (category/level/family/type/parameter names) to exact Revit names with "
-                "confidence and alternatives. Always call this before filter_elements or update_element_parameters."
+                "confidence and alternatives. Always call this before filter_elements or update_element_parameters, "
+                "especially for ambiguous user terms like 'glass'."
             ),
             json_schema={
                 "type": "object",

@@ -1,21 +1,148 @@
 # RevitMCP: Element-related HTTP routes
 # -*- coding: UTF-8 -*-
 
+import difflib
+import re
+import unicodedata
+
+import System
 from pyrevit import routes, script, DB
 from System.Collections.Generic import List
 
 
-def _resolve_built_in_category(category_name, route_logger):
+def _coerce_text(value):
+    if value is None:
+        return ""
+
+    try:
+        text = str(value)
+    except Exception:
+        return ""
+
+    text = text.replace(u"\u00A0", " ").replace(u"\u2007", " ").replace(u"\u202F", " ")
+    return unicodedata.normalize("NFKC", text)
+
+
+def _collapse_whitespace(value):
+    return re.sub(r"\s+", " ", _coerce_text(value)).strip()
+
+
+def _normalize_category_key(value):
+    text = _collapse_whitespace(value).lower()
+    if text.startswith("ost_"):
+        text = text[4:]
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _get_built_in_category_lookup():
+    lookup = {}
+    try:
+        category_names = list(System.Enum.GetNames(DB.BuiltInCategory))
+    except Exception:
+        category_names = [name for name in dir(DB.BuiltInCategory) if name.startswith("OST_")]
+
+    for category_name in category_names:
+        if not hasattr(DB.BuiltInCategory, category_name):
+            continue
+        built_in_category = getattr(DB.BuiltInCategory, category_name)
+        lookup.setdefault(_normalize_category_key(category_name), built_in_category)
+        lookup.setdefault(_normalize_category_key(category_name[4:]), built_in_category)
+
+    return lookup
+
+
+def _get_document_category_lookup(doc):
+    lookup = {}
+    if not doc:
+        return lookup
+
+    try:
+        for category in doc.Settings.Categories:
+            category_name = getattr(category, "Name", None)
+            normalized_key = _normalize_category_key(category_name)
+            if not normalized_key:
+                continue
+
+            built_in_category = None
+            try:
+                built_in_category = System.Enum.ToObject(DB.BuiltInCategory, category.Id.IntegerValue)
+            except Exception:
+                built_in_category = None
+
+            lookup.setdefault(normalized_key, []).append(
+                {
+                    "name": category_name,
+                    "built_in_category": built_in_category,
+                }
+            )
+    except Exception:
+        return lookup
+
+    return lookup
+
+
+def _suggest_category_names(doc, category_name, limit=5):
+    normalized_query = _normalize_category_key(category_name)
+    if not normalized_query or not doc:
+        return []
+
+    suggestions = []
+    seen = set()
+
+    try:
+        for category in doc.Settings.Categories:
+            actual_name = getattr(category, "Name", None)
+            normalized_candidate = _normalize_category_key(actual_name)
+            if not actual_name or not normalized_candidate or actual_name in seen:
+                continue
+
+            seen.add(actual_name)
+            score = difflib.SequenceMatcher(None, normalized_query, normalized_candidate).ratio()
+            if normalized_query in normalized_candidate:
+                score += 0.15
+            suggestions.append((score, actual_name))
+    except Exception:
+        return []
+
+    suggestions.sort(key=lambda item: (-item[0], item[1]))
+    return [name for score, name in suggestions if score >= 0.35][:limit]
+
+
+def _resolve_built_in_category(category_name, route_logger, doc=None):
     if not category_name:
         return None
 
-    if hasattr(DB.BuiltInCategory, category_name):
-        return getattr(DB.BuiltInCategory, category_name)
+    raw_name = _collapse_whitespace(category_name)
+    if hasattr(DB.BuiltInCategory, raw_name):
+        return getattr(DB.BuiltInCategory, raw_name)
 
-    if not category_name.startswith("OST_"):
-        possible_ost = "OST_" + category_name.replace(" ", "")
+    normalized_key = _normalize_category_key(raw_name)
+    if not normalized_key:
+        return None
+
+    document_category_lookup = _get_document_category_lookup(doc)
+    document_matches = document_category_lookup.get(normalized_key, [])
+    for match in document_matches:
+        built_in_category = match.get("built_in_category")
+        if built_in_category is not None:
+            if match.get("name") != raw_name:
+                route_logger.info(
+                    "Interpreted category '%s' as document category '%s'.",
+                    category_name,
+                    match.get("name"),
+                )
+            return built_in_category
+
+    built_in_lookup = _get_built_in_category_lookup()
+    built_in_category = built_in_lookup.get(normalized_key)
+    if built_in_category is not None:
+        route_logger.info("Resolved category '%s' via normalized BuiltInCategory lookup.", category_name)
+        return built_in_category
+
+    if not raw_name.upper().startswith("OST_"):
+        possible_ost = "OST_" + re.sub(r"[^A-Za-z0-9]+", "", raw_name)
         if hasattr(DB.BuiltInCategory, possible_ost):
-            route_logger.info("Interpreted category '{}' as '{}'.".format(category_name, possible_ost))
+            route_logger.info("Interpreted category '%s' as '%s'.", category_name, possible_ost)
             return getattr(DB.BuiltInCategory, possible_ost)
 
     return None
@@ -76,6 +203,39 @@ def _get_parameter_display_value(param, doc):
         return "Not available"
 
 
+def _get_parameter_typed_value(param, doc):
+    typed_value = {
+        "display_value": _get_parameter_display_value(param, doc),
+        "storage_type": None,
+        "has_value": bool(param and getattr(param, "HasValue", False)),
+        "is_numeric": False,
+    }
+
+    if not param:
+        return typed_value
+
+    try:
+        typed_value["storage_type"] = str(param.StorageType)
+    except Exception:
+        typed_value["storage_type"] = None
+
+    if not getattr(param, "HasValue", False):
+        return typed_value
+
+    try:
+        if param.StorageType == DB.StorageType.Double:
+            typed_value["is_numeric"] = True
+            typed_value["numeric_value"] = float(param.AsDouble())
+        elif param.StorageType == DB.StorageType.Integer:
+            typed_value["is_numeric"] = True
+            typed_value["numeric_value"] = int(param.AsInteger())
+    except Exception:
+        typed_value["is_numeric"] = False
+        typed_value.pop("numeric_value", None)
+
+    return typed_value
+
+
 def _is_meaningful_value(value):
     text = "" if value is None else str(value).strip()
     if not text:
@@ -86,7 +246,9 @@ def _is_meaningful_value(value):
 
 
 def _parse_length_to_internal_feet(value):
-    value_str = str(value).strip()
+    value_str = _collapse_whitespace(value)
+    if not value_str:
+        raise ValueError("Length value is empty.")
 
     if "'" in value_str or '"' in value_str:
         feet = 0.0
@@ -105,7 +267,31 @@ def _parse_length_to_internal_feet(value):
 
         return feet + (inches / 12.0)
 
-    return float(value_str)
+    normalized_value = value_str.lower()
+    unit_match = re.match(
+        r"^([-+]?\d*\.?\d+)\s*(millimeters|millimeter|mm|centimeters|centimeter|cm|meters|meter|m|feet|foot|ft|inches|inch|in)?$",
+        normalized_value,
+    )
+    if not unit_match:
+        return float(value_str)
+
+    magnitude = float(unit_match.group(1))
+    unit = unit_match.group(2)
+    if not unit:
+        return magnitude
+
+    if unit in ("millimeters", "millimeter", "mm"):
+        return magnitude / 304.8
+    if unit in ("centimeters", "centimeter", "cm"):
+        return magnitude / 30.48
+    if unit in ("meters", "meter", "m"):
+        return magnitude / 0.3048
+    if unit in ("inches", "inch", "in"):
+        return magnitude / 12.0
+    if unit in ("feet", "foot", "ft"):
+        return magnitude
+
+    return magnitude
 
 
 def _set_parameter_value(param, new_value):
@@ -156,8 +342,124 @@ def _normalize_element_ids(raw_ids):
     return valid_ids, requested_count, invalid_ids
 
 
-def _normalize_category_key(value):
-    return str(value or "").strip().lower().replace("ost_", "").replace(" ", "")
+def _normalize_filter_operator(operator):
+    alias_map = {
+        None: "equals",
+        "": "equals",
+        "equals": "equals",
+        "==": "equals",
+        "contains": "contains",
+        "not_equals": "not_equals",
+        "not equal": "not_equals",
+        "!=": "not_equals",
+        "starts_with": "starts_with",
+        "ends_with": "ends_with",
+        "greater_than": "greater_than",
+        ">": "greater_than",
+        "greater_than_or_equal": "greater_than_or_equal",
+        ">=": "greater_than_or_equal",
+        "less_than": "less_than",
+        "<": "less_than",
+        "less_than_or_equal": "less_than_or_equal",
+        "<=": "less_than_or_equal",
+    }
+    return alias_map.get(str(operator or "").strip().lower())
+
+
+def _is_numeric_operator(operator):
+    return operator in ("greater_than", "greater_than_or_equal", "less_than", "less_than_or_equal")
+
+
+def _compare_numeric_values(candidate_value, expected_value, operator):
+    if operator == "greater_than":
+        return candidate_value > expected_value
+    if operator == "greater_than_or_equal":
+        return candidate_value >= expected_value
+    if operator == "less_than":
+        return candidate_value < expected_value
+    if operator == "less_than_or_equal":
+        return candidate_value <= expected_value
+    return False
+
+
+def _evaluate_parameter_filter(param, expected_value, operator, doc):
+    normalized_operator = _normalize_filter_operator(operator)
+    if not normalized_operator:
+        return False, "Unsupported filter operator '{}'.".format(operator)
+
+    if not param:
+        return False, None
+
+    param_name = "Unknown Parameter"
+    try:
+        if param.Definition and param.Definition.Name:
+            param_name = param.Definition.Name
+    except Exception:
+        pass
+
+    if _is_numeric_operator(normalized_operator):
+        if not getattr(param, "HasValue", False):
+            return False, None
+
+        if param.StorageType == DB.StorageType.Double:
+            try:
+                candidate_value = float(param.AsDouble())
+                expected_numeric = _parse_length_to_internal_feet(expected_value)
+            except Exception:
+                return (
+                    False,
+                    "Could not parse numeric filter value '{}'. Use a plain number or an explicit length such as 2000 mm, 2 m, or 6' 6\".".format(
+                        expected_value
+                    ),
+                )
+            return _compare_numeric_values(candidate_value, expected_numeric, normalized_operator), None
+
+        if param.StorageType == DB.StorageType.Integer:
+            try:
+                candidate_value = int(param.AsInteger())
+                expected_numeric = float(_collapse_whitespace(expected_value))
+            except Exception:
+                return (
+                    False,
+                    "Could not parse numeric filter value '{}'. Integer filters require a numeric value.".format(
+                        expected_value
+                    ),
+                )
+            return _compare_numeric_values(float(candidate_value), float(expected_numeric), normalized_operator), None
+
+        return (
+            False,
+            "Parameter '{}' is not numeric/filterable with operator '{}'.".format(param_name, normalized_operator),
+        )
+
+    current_value = _get_parameter_display_value(param, doc)
+    current_text = str(current_value or "")
+    expected_text = str(expected_value)
+
+    current_cmp = current_text.lower()
+    expected_cmp = expected_text.lower()
+
+    if normalized_operator == "equals":
+        return current_cmp == expected_cmp, None
+    if normalized_operator == "contains":
+        return expected_cmp in current_cmp, None
+    if normalized_operator == "not_equals":
+        return current_cmp != expected_cmp, None
+    if normalized_operator == "starts_with":
+        return current_cmp.startswith(expected_cmp), None
+    if normalized_operator == "ends_with":
+        return current_cmp.endswith(expected_cmp), None
+
+    return False, "Unsupported filter operator '{}'.".format(operator)
+
+
+def _append_parameter_property(properties, typed_properties, param_name, param, doc, populated_only=False):
+    display_value = _get_parameter_display_value(param, doc) if param else "Not available"
+    if populated_only and not _is_meaningful_value(display_value):
+        return
+
+    properties[param_name] = display_value
+    typed_properties[param_name] = _get_parameter_typed_value(param, doc)
 
 
 def _get_element_identity(element, doc):
@@ -570,10 +872,16 @@ def register_routes(api):
             doc = current_uiapp.ActiveUIDocument.Document
 
             # Category validation and element collection
-            built_in_category = _resolve_built_in_category(category_name_payload, route_logger)
+            built_in_category = _resolve_built_in_category(category_name_payload, route_logger, doc=doc)
             if not built_in_category:
                 route_logger.error("Invalid category_name: '{}'. Not a recognized BuiltInCategory.".format(category_name_payload))
-                return routes.Response(status=400, data={"error": "Invalid category_name: '{}'.".format(category_name_payload)})
+                return routes.Response(
+                    status=400,
+                    data={
+                        "error": "Invalid category_name: '{}'.".format(category_name_payload),
+                        "suggestions": _suggest_category_names(doc, category_name_payload),
+                    },
+                )
 
             # Use ToElementIds() for better performance - no need for ToElements()
             element_ids_collector = DB.FilteredElementCollector(doc)\
@@ -686,9 +994,15 @@ def register_routes(api):
 
             doc = current_uiapp.ActiveUIDocument.Document
 
-            built_in_category = _resolve_built_in_category(category_name, route_logger)
+            built_in_category = _resolve_built_in_category(category_name, route_logger, doc=doc)
             if not built_in_category:
-                return routes.Response(status=400, data={"error": "Invalid category_name: '{}'.".format(category_name)})
+                return routes.Response(
+                    status=400,
+                    data={
+                        "error": "Invalid category_name: '{}'.".format(category_name),
+                        "suggestions": _suggest_category_names(doc, category_name),
+                    },
+                )
 
             collector = DB.FilteredElementCollector(doc).OfCategory(built_in_category).WhereElementIsNotElementType()
 
@@ -716,68 +1030,29 @@ def register_routes(api):
             route_logger.info("Found {} elements before parameter filtering".format(len(elements)))
 
             filtered_elements = []
+            filter_error = None
             for element in elements:
                 include_element = True
 
                 for param_filter in parameter_filters:
                     param_name = param_filter.get('name')
                     expected_value = param_filter.get('value')
-                    condition = (param_filter.get('operator') or param_filter.get('condition') or 'equals').lower()
+                    condition = param_filter.get('operator') or param_filter.get('condition') or 'equals'
 
                     if not param_name or expected_value is None:
                         continue
 
                     param = _find_parameter(element, param_name)
-                    if not param:
+                    matched, filter_error = _evaluate_parameter_filter(param, expected_value, condition, doc)
+                    if filter_error:
+                        break
+
+                    if not matched:
                         include_element = False
                         break
 
-                    current_value = _get_parameter_display_value(param, doc)
-                    current_text = str(current_value or "")
-                    expected_text = str(expected_value)
-
-                    current_cmp = current_text.lower()
-                    expected_cmp = expected_text.lower()
-
-                    if condition in ("equals", "=="):
-                        if current_cmp != expected_cmp:
-                            include_element = False
-                            break
-                    elif condition in ("contains",):
-                        if expected_cmp not in current_cmp:
-                            include_element = False
-                            break
-                    elif condition in ("not_equals", "!=", "not equal"):
-                        if current_cmp == expected_cmp:
-                            include_element = False
-                            break
-                    elif condition in ("starts_with",):
-                        if not current_cmp.startswith(expected_cmp):
-                            include_element = False
-                            break
-                    elif condition in ("ends_with",):
-                        if not current_cmp.endswith(expected_cmp):
-                            include_element = False
-                            break
-                    elif condition in ("greater_than", ">"):
-                        try:
-                            if float(current_text.split()[0]) <= float(expected_text.split()[0]):
-                                include_element = False
-                                break
-                        except Exception:
-                            include_element = False
-                            break
-                    elif condition in ("less_than", "<"):
-                        try:
-                            if float(current_text.split()[0]) >= float(expected_text.split()[0]):
-                                include_element = False
-                                break
-                        except Exception:
-                            include_element = False
-                            break
-                    else:
-                        include_element = False
-                        break
+                if filter_error:
+                    return routes.Response(status=400, data={"error": filter_error})
 
                 if include_element:
                     filtered_elements.append(element)
@@ -826,10 +1101,11 @@ def register_routes(api):
                 try:
                     element = doc.GetElement(DB.ElementId(int(id_str)))
                     if not element:
-                        results.append({"element_id": id_str, "error": "Element not found", "properties": {}})
+                        results.append({"element_id": id_str, "error": "Element not found", "properties": {}, "typed_properties": {}})
                         continue
 
                     properties = {}
+                    typed_properties = {}
 
                     if include_all_parameters:
                         # Discover instance parameters first.
@@ -838,10 +1114,7 @@ def register_routes(api):
                                 if not p or not p.Definition or not p.Definition.Name:
                                     continue
                                 pname = p.Definition.Name
-                                pvalue = _get_parameter_display_value(p, doc)
-                                if populated_only and not _is_meaningful_value(pvalue):
-                                    continue
-                                properties[pname] = pvalue
+                                _append_parameter_property(properties, typed_properties, pname, p, doc, populated_only=populated_only)
                             except Exception:
                                 continue
 
@@ -858,7 +1131,14 @@ def register_routes(api):
                                         if populated_only and not _is_meaningful_value(pvalue):
                                             continue
                                         if pname not in properties or not _is_meaningful_value(properties.get(pname)):
-                                            properties[pname] = pvalue
+                                            _append_parameter_property(
+                                                properties,
+                                                typed_properties,
+                                                pname,
+                                                p,
+                                                doc,
+                                                populated_only=populated_only,
+                                            )
                                     except Exception:
                                         continue
                         except Exception:
@@ -880,7 +1160,7 @@ def register_routes(api):
                     if not include_all_parameters:
                         for param_name in names_to_use:
                             param = _find_parameter(element, param_name)
-                            properties[param_name] = _get_parameter_display_value(param, doc) if param else "Not available"
+                            _append_parameter_property(properties, typed_properties, param_name, param, doc)
 
                     # Enrich with stable, human-readable identity values.
                     try:
@@ -900,11 +1180,11 @@ def register_routes(api):
                         [k for k, v in properties.items() if _is_meaningful_value(v) and k not in ("available_parameter_names", "Element_Name", "Category")]
                     )
 
-                    results.append({"element_id": id_str, "properties": properties})
+                    results.append({"element_id": id_str, "properties": properties, "typed_properties": typed_properties})
 
                 except Exception as elem_error:
                     route_logger.warning("Error processing element {}: {}".format(id_str, elem_error))
-                    results.append({"element_id": id_str, "error": str(elem_error), "properties": {}})
+                    results.append({"element_id": id_str, "error": str(elem_error), "properties": {}, "typed_properties": {}})
 
             return {
                 "status": "success",

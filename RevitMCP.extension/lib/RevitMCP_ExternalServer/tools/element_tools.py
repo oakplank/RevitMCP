@@ -1,3 +1,5 @@
+import re
+
 from RevitMCP_ExternalServer.tools.context_tools import resolve_revit_targets_internal
 from RevitMCP_ExternalServer.tools.registry import ToolDefinition
 
@@ -11,6 +13,10 @@ FILTER_ELEMENTS_TOOL_NAME = "filter_elements"
 FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME = "filter_stored_elements_by_parameter"
 GET_ELEMENT_PROPERTIES_TOOL_NAME = "get_element_properties"
 UPDATE_ELEMENT_PARAMETERS_TOOL_NAME = "update_element_parameters"
+
+FILTER_STRING_OPERATORS = ["contains", "equals", "not_equals", "starts_with", "ends_with"]
+FILTER_NUMERIC_OPERATORS = ["greater_than", "greater_than_or_equal", "less_than", "less_than_or_equal"]
+FILTER_OPERATORS = FILTER_STRING_OPERATORS + FILTER_NUMERIC_OPERATORS
 
 
 def get_active_selection_handler(services, limit: int = 200, **_kwargs) -> dict:
@@ -286,6 +292,27 @@ def filter_elements_handler(
         parameters,
     )
 
+    normalized_parameters = []
+    for parameter in parameters or []:
+        if not isinstance(parameter, dict):
+            return {"status": "error", "message": "Each parameter filter must be an object."}
+
+        normalized_parameter = dict(parameter)
+        raw_operator = normalized_parameter.get("operator", normalized_parameter.get("condition"))
+        normalized_operator = _normalize_filter_operator(raw_operator)
+        if raw_operator is not None and normalized_operator is None:
+            return {
+                "status": "error",
+                "message": "Unsupported filter operator '{}'. Supported operators: {}.".format(
+                    raw_operator,
+                    ", ".join(FILTER_OPERATORS),
+                ),
+            }
+        normalized_parameter["condition"] = normalized_operator or "equals"
+        normalized_parameters.append(normalized_parameter)
+
+    parameters = normalized_parameters
+
     resolution = resolve_revit_targets_internal(
         services,
         {
@@ -403,10 +430,134 @@ def filter_elements_handler(
     )
 
 
-def _matches_filter_value(candidate_value, expected_value, operator="contains", case_sensitive=False):
+def _collapse_whitespace(value):
+    return re.sub(r"\s+", " ", str(value or "").replace(u"\u00A0", " ")).strip()
+
+
+def _normalize_filter_operator(operator):
+    alias_map = {
+        None: "contains",
+        "": "contains",
+        "contains": "contains",
+        "equals": "equals",
+        "==": "equals",
+        "not_equals": "not_equals",
+        "not equal": "not_equals",
+        "!=": "not_equals",
+        "starts_with": "starts_with",
+        "ends_with": "ends_with",
+        "greater_than": "greater_than",
+        ">": "greater_than",
+        "greater_than_or_equal": "greater_than_or_equal",
+        ">=": "greater_than_or_equal",
+        "less_than": "less_than",
+        "<": "less_than",
+        "less_than_or_equal": "less_than_or_equal",
+        "<=": "less_than_or_equal",
+    }
+    return alias_map.get(str(operator or "").strip().lower())
+
+
+def _is_numeric_operator(operator):
+    return operator in FILTER_NUMERIC_OPERATORS
+
+
+def _compare_numeric_values(candidate_value, expected_value, operator):
+    if operator == "greater_than":
+        return candidate_value > expected_value
+    if operator == "greater_than_or_equal":
+        return candidate_value >= expected_value
+    if operator == "less_than":
+        return candidate_value < expected_value
+    if operator == "less_than_or_equal":
+        return candidate_value <= expected_value
+    return False
+
+
+def _parse_length_to_internal_feet(value):
+    value_str = _collapse_whitespace(value)
+    if not value_str:
+        raise ValueError("Length value is empty.")
+
+    if "'" in value_str or '"' in value_str:
+        feet = 0.0
+        inches = 0.0
+
+        if "'" in value_str:
+            feet_part = value_str.split("'")[0].strip()
+            feet = float(feet_part) if feet_part else 0.0
+
+        if '"' in value_str:
+            inches_part = value_str
+            if "'" in value_str:
+                inches_part = value_str.split("'")[1]
+            inches_part = inches_part.replace('"', '').strip()
+            inches = float(inches_part) if inches_part else 0.0
+
+        return feet + (inches / 12.0)
+
+    normalized_value = value_str.lower()
+    unit_match = re.match(
+        r"^([-+]?\d*\.?\d+)\s*(millimeters|millimeter|mm|centimeters|centimeter|cm|meters|meter|m|feet|foot|ft|inches|inch|in)?$",
+        normalized_value,
+    )
+    if not unit_match:
+        return float(value_str)
+
+    magnitude = float(unit_match.group(1))
+    unit = unit_match.group(2)
+    if not unit:
+        return magnitude
+
+    if unit in ("millimeters", "millimeter", "mm"):
+        return magnitude / 304.8
+    if unit in ("centimeters", "centimeter", "cm"):
+        return magnitude / 30.48
+    if unit in ("meters", "meter", "m"):
+        return magnitude / 0.3048
+    if unit in ("inches", "inch", "in"):
+        return magnitude / 12.0
+    if unit in ("feet", "foot", "ft"):
+        return magnitude
+
+    return magnitude
+
+
+def _matches_filter_value(candidate_value, expected_value, operator="contains", case_sensitive=False, typed_value=None):
     candidate = "" if candidate_value in (None, "Not available") else str(candidate_value)
     expected = "" if expected_value is None else str(expected_value)
-    normalized_operator = str(operator or "contains").strip().lower()
+    normalized_operator = _normalize_filter_operator(operator)
+    if not normalized_operator:
+        return False, "Unsupported filter operator '{}'. Supported operators: {}.".format(
+            operator,
+            ", ".join(FILTER_OPERATORS),
+        )
+
+    if _is_numeric_operator(normalized_operator):
+        numeric_candidate = None
+        storage_type = None
+        if isinstance(typed_value, dict):
+            storage_type = typed_value.get("storage_type")
+            if typed_value.get("is_numeric") and typed_value.get("numeric_value") is not None:
+                numeric_candidate = float(typed_value.get("numeric_value"))
+
+        if numeric_candidate is None:
+            return False, "Parameter value is not numeric/filterable with operator '{}'.".format(normalized_operator)
+
+        try:
+            if storage_type == "Double":
+                expected_numeric = _parse_length_to_internal_feet(expected)
+            else:
+                expected_numeric = float(_collapse_whitespace(expected))
+        except Exception:
+            return (
+                False,
+                "Could not parse numeric filter value '{}'. Use a plain number or an explicit length such as 2000 mm, 2 m, or 6' 6\".".format(
+                    expected
+                ),
+            )
+
+        return _compare_numeric_values(numeric_candidate, float(expected_numeric), normalized_operator), None
 
     if not case_sensitive:
         candidate_cmp = candidate.lower()
@@ -416,16 +567,16 @@ def _matches_filter_value(candidate_value, expected_value, operator="contains", 
         expected_cmp = expected
 
     if normalized_operator in ("contains",):
-        return expected_cmp in candidate_cmp
+        return expected_cmp in candidate_cmp, None
     if normalized_operator in ("equals", "=="):
-        return candidate_cmp == expected_cmp
+        return candidate_cmp == expected_cmp, None
     if normalized_operator in ("not_equals", "!=", "not equal"):
-        return candidate_cmp != expected_cmp
+        return candidate_cmp != expected_cmp, None
     if normalized_operator in ("starts_with",):
-        return candidate_cmp.startswith(expected_cmp)
+        return candidate_cmp.startswith(expected_cmp), None
     if normalized_operator in ("ends_with",):
-        return candidate_cmp.endswith(expected_cmp)
-    return False
+        return candidate_cmp.endswith(expected_cmp), None
+    return False, "Unsupported filter operator '{}'.".format(operator)
 
 
 def filter_stored_elements_by_parameter_handler(
@@ -450,8 +601,18 @@ def filter_stored_elements_by_parameter_handler(
         batch_size,
     )
 
+    normalized_operator = _normalize_filter_operator(operator)
     if not parameter_name or value is None:
         return {"status": "error", "message": "parameter_name and value are required."}
+    if not normalized_operator:
+        return {
+            "status": "error",
+            "message": "Unsupported filter operator '{}'. Supported operators: {}.".format(
+                operator,
+                ", ".join(FILTER_OPERATORS),
+            ),
+        }
+    operator = normalized_operator
 
     parameter_resolution = resolve_revit_targets_internal(services, {"parameter_names": [parameter_name]})
     param_map = parameter_resolution.get("resolved", {}).get("parameter_names", {})
@@ -505,8 +666,19 @@ def filter_stored_elements_by_parameter_handler(
         for element_data in elements:
             element_id = str(element_data.get("element_id", "")).strip()
             properties = element_data.get("properties", {}) or {}
+            typed_properties = element_data.get("typed_properties", {}) or {}
             current_value = properties.get(parameter_name, "Not available")
-            if _matches_filter_value(current_value, value, operator=operator, case_sensitive=case_sensitive):
+            typed_value = typed_properties.get(parameter_name, {})
+            matched, match_error = _matches_filter_value(
+                current_value,
+                value,
+                operator=operator,
+                case_sensitive=case_sensitive,
+                typed_value=typed_value,
+            )
+            if match_error:
+                return {"status": "error", "message": match_error, "parameter_name": parameter_name, "operator": operator}
+            if matched:
                 matched_ids.append(element_id)
                 if len(matched_samples) < services.config.max_records_in_response:
                     matched_samples.append({"element_id": element_id, parameter_name: current_value})
@@ -766,7 +938,10 @@ def build_element_tools() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name=FILTER_ELEMENTS_TOOL_NAME,
-            description="Filters elements by category, level, and parameter conditions. Use this when you need to find specific elements with certain criteria.",
+            description=(
+                "Filters elements by category, level, and parameter conditions. Supports string operators plus "
+                "numeric range operators for numeric and length parameters."
+            ),
             json_schema={
                 "type": "object",
                 "properties": {
@@ -779,9 +954,18 @@ def build_element_tools() -> list[ToolDefinition]:
                             "properties": {
                                 "name": {"type": "string"},
                                 "value": {"type": "string"},
+                                "operator": {
+                                    "type": "string",
+                                    "enum": FILTER_OPERATORS,
+                                    "description": (
+                                        "Preferred comparison operator. For numeric and length parameters, use "
+                                        "greater_than, greater_than_or_equal, less_than, or less_than_or_equal."
+                                    ),
+                                },
                                 "condition": {
                                     "type": "string",
-                                    "enum": ["equals", "contains", "greater_than", "less_than"],
+                                    "enum": FILTER_OPERATORS,
+                                    "description": "Legacy alias for operator. The same values are supported.",
                                 },
                             },
                             "required": ["name", "value"],
@@ -794,7 +978,11 @@ def build_element_tools() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name=FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME,
-            description="Filters a previously stored element set using server-side batched parameter reads.",
+            description=(
+                "Filters a previously stored element set using server-side batched parameter reads. Supports the "
+                "same string and numeric operators as filter_elements and is intended for narrowing stored results "
+                "before selection."
+            ),
             json_schema={
                 "type": "object",
                 "properties": {
@@ -804,7 +992,11 @@ def build_element_tools() -> list[ToolDefinition]:
                     "value": {"type": "string"},
                     "operator": {
                         "type": "string",
-                        "enum": ["contains", "equals", "not_equals", "starts_with", "ends_with"],
+                        "enum": FILTER_OPERATORS,
+                        "description": (
+                            "Comparison operator. Numeric and length parameters support greater_than, "
+                            "greater_than_or_equal, less_than, and less_than_or_equal."
+                        ),
                     },
                     "batch_size": {"type": "integer"},
                     "case_sensitive": {"type": "boolean"},
