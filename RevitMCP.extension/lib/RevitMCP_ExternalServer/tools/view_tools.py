@@ -1,0 +1,514 @@
+import difflib
+import re
+from collections import defaultdict
+
+from RevitMCP_ExternalServer.core.runtime_config import bounded_int
+from RevitMCP_ExternalServer.tools.registry import ToolDefinition
+
+
+GET_ACTIVE_VIEW_INFO_TOOL_NAME = "get_active_view_info"
+GET_ACTIVE_VIEW_ELEMENTS_TOOL_NAME = "get_active_view_elements"
+PLACE_VIEW_ON_SHEET_TOOL_NAME = "place_view_on_sheet"
+LIST_VIEWS_TOOL_NAME = "list_views"
+ANALYZE_VIEW_NAMING_PATTERNS_TOOL_NAME = "analyze_view_naming_patterns"
+SUGGEST_VIEW_NAME_CORRECTIONS_TOOL_NAME = "suggest_view_name_corrections"
+
+
+def _collapse_spaces(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _normalize_view_name(value: str) -> str:
+    text = _collapse_spaces(value)
+    text = re.sub(r"\s*-\s*", " - ", text)
+    return _collapse_spaces(text)
+
+
+def _view_name_signature(value: str) -> str:
+    text = _normalize_view_name(value).upper()
+    text = re.sub(r"\d+", "{#}", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _view_similarity(value_a: str, value_b: str) -> float:
+    return difflib.SequenceMatcher(None, _normalize_view_name(value_a).lower(), _normalize_view_name(value_b).lower()).ratio()
+
+
+def _alpha_case_style(value: str) -> str:
+    alpha = "".join(character for character in str(value or "") if character.isalpha())
+    if not alpha:
+        return "mixed"
+    if alpha.upper() == alpha:
+        return "upper"
+    if alpha.lower() == alpha:
+        return "lower"
+    if alpha.title() == alpha:
+        return "title"
+    return "mixed"
+
+
+def _apply_view_style_from_exemplar(source_name: str, exemplar_name: str) -> str:
+    source = _normalize_view_name(source_name)
+    exemplar = _normalize_view_name(exemplar_name)
+    source_parts = re.findall(r"\d+|[A-Za-z]+|[^A-Za-z0-9]+", source)
+    exemplar_parts = re.findall(r"\d+|[A-Za-z]+|[^A-Za-z0-9]+", exemplar)
+
+    styled = []
+    for index, part in enumerate(source_parts):
+        if part.isalpha():
+            exemplar_part = exemplar_parts[index] if index < len(exemplar_parts) else ""
+            style = _alpha_case_style(exemplar_part)
+            if style == "upper":
+                styled.append(part.upper())
+            elif style == "lower":
+                styled.append(part.lower())
+            elif style == "title":
+                styled.append(part.title())
+            else:
+                styled.append(part)
+        elif part.isdigit():
+            styled.append(part)
+        else:
+            exemplar_separator = exemplar_parts[index] if index < len(exemplar_parts) else part
+            if re.search(r"[^A-Za-z0-9]", exemplar_separator or ""):
+                styled.append(exemplar_separator)
+            else:
+                styled.append(part)
+
+    return _normalize_view_name("".join(styled))
+
+
+def get_active_view_info_handler(services, **_kwargs) -> dict:
+    services.logger.info("MCP Tool executed: %s", GET_ACTIVE_VIEW_INFO_TOOL_NAME)
+    return services.revit_client.call_listener(command_path="/views/active/info", method="GET")
+
+
+def get_active_view_elements_handler(
+    services,
+    category_names: list[str] = None,
+    limit: int = 200,
+    **_kwargs,
+) -> dict:
+    safe_limit = bounded_int(limit, 200, min_value=1, max_value=2000)
+    normalized_categories = category_names if isinstance(category_names, list) else []
+    services.logger.info(
+        "MCP Tool executed: %s with %s category filters and limit=%s",
+        GET_ACTIVE_VIEW_ELEMENTS_TOOL_NAME,
+        len(normalized_categories),
+        safe_limit,
+    )
+
+    result = services.revit_client.call_listener(
+        command_path="/views/active/elements",
+        method="POST",
+        payload_data={"category_names": normalized_categories, "limit": safe_limit},
+    )
+
+    if result.get("status") == "success" and result.get("element_ids"):
+        view_info = result.get("view", {}) if isinstance(result.get("view"), dict) else {}
+        storage_seed = "active_view_{}".format(view_info.get("name", "current"))
+        if len(normalized_categories) == 1:
+            storage_seed = "{}_{}".format(storage_seed, normalized_categories[0])
+        elif len(normalized_categories) > 1:
+            storage_seed = "{}_filtered".format(storage_seed)
+
+        stored_as, result_handle = services.result_store.store_elements(
+            storage_seed,
+            result.get("element_ids", []),
+            result.get("returned_count", len(result.get("element_ids", []))),
+        )
+        result["stored_as"] = stored_as
+        result["result_handle"] = result_handle
+        result["storage_message"] = "Active view results stored as '{}' ({})".format(stored_as, result_handle)
+
+    return services.result_store.compact_result_payload(
+        result,
+        preserve_keys=[
+            "status",
+            "message",
+            "stored_as",
+            "result_handle",
+            "storage_message",
+            "total_count",
+            "returned_count",
+            "truncated",
+            "limit",
+            "view",
+        ],
+    )
+
+
+def place_view_on_sheet_handler(services, view_name: str, exact_match: bool = False, **_kwargs) -> dict:
+    services.logger.info(
+        "MCP Tool executed: %s with view_name: %s, exact_match: %s",
+        PLACE_VIEW_ON_SHEET_TOOL_NAME,
+        view_name,
+        exact_match,
+    )
+    return services.revit_client.call_listener(
+        command_path="/sheets/place_view",
+        method="POST",
+        payload_data={"view_name": view_name, "exact_match": exact_match},
+    )
+
+
+def list_views_handler(services, **_kwargs) -> dict:
+    services.logger.info("MCP Tool executed: %s", LIST_VIEWS_TOOL_NAME)
+    result = services.revit_client.call_listener(command_path="/sheets/list_views", method="GET")
+    return services.result_store.compact_result_payload(result, preserve_keys=["status", "message"])
+
+
+def analyze_view_naming_patterns_internal(
+    services,
+    view_type_filter: list[str] = None,
+    min_group_size: int = 6,
+    outlier_similarity_threshold: float = 0.72,
+) -> dict:
+    views_result = services.revit_client.call_listener(command_path="/sheets/list_views", method="GET")
+    if views_result.get("status") == "error":
+        return views_result
+
+    all_views = views_result.get("views", []) or []
+    if not isinstance(all_views, list):
+        return {"status": "error", "message": "Unexpected views payload from list_views."}
+
+    allowed_types = set((view_type_filter or []))
+    if allowed_types:
+        working_views = [view for view in all_views if view.get("type") in allowed_types]
+    else:
+        working_views = all_views
+
+    if not working_views:
+        return {
+            "status": "success",
+            "message": "No views available for naming analysis with current filters.",
+            "count": 0,
+            "analysis": {"groups": [], "outliers": []},
+        }
+
+    by_type = defaultdict(list)
+    for view in working_views:
+        name = view.get("name")
+        if not name:
+            continue
+        by_type[view.get("type", "Unknown")].append(view)
+
+    groups = []
+    outliers = []
+
+    for view_type, type_views in by_type.items():
+        by_signature = defaultdict(list)
+        for view in type_views:
+            signature = _view_name_signature(view.get("name", ""))
+            by_signature[signature].append(view)
+
+        signature_clusters = []
+        for signature, members in by_signature.items():
+            example_names = [member.get("name", "") for member in members[:3]]
+            signature_clusters.append(
+                {
+                    "signature": signature,
+                    "count": len(members),
+                    "example_names": example_names,
+                    "members": members,
+                }
+            )
+        signature_clusters.sort(key=lambda cluster: cluster["count"], reverse=True)
+
+        dominant_cluster = signature_clusters[0] if signature_clusters else None
+        dominant_example = dominant_cluster["members"][0].get("name", "") if dominant_cluster else ""
+
+        group_summary = {
+            "view_type": view_type,
+            "total_views": len(type_views),
+            "cluster_count": len(signature_clusters),
+            "dominant_patterns": [
+                {
+                    "signature": cluster["signature"],
+                    "count": cluster["count"],
+                    "example_names": cluster["example_names"],
+                }
+                for cluster in signature_clusters[:5]
+            ],
+            "outlier_count": 0,
+        }
+
+        if dominant_cluster and len(type_views) >= int(min_group_size):
+            for cluster in signature_clusters:
+                cluster_ratio = float(cluster["count"]) / float(len(type_views))
+                weak_cluster = cluster["count"] == 1 or cluster_ratio < 0.08
+                if not weak_cluster:
+                    continue
+
+                for member in cluster["members"]:
+                    name = member.get("name", "")
+                    similarity = _view_similarity(name, dominant_example) if dominant_example else 0.0
+                    if similarity >= float(outlier_similarity_threshold) and cluster["count"] > 1:
+                        continue
+                    outliers.append(
+                        {
+                            "view_id": member.get("id"),
+                            "name": name,
+                            "view_type": view_type,
+                            "detected_signature": cluster["signature"],
+                            "nearest_signature": dominant_cluster["signature"],
+                            "nearest_example": dominant_example,
+                            "similarity_to_nearest": round(similarity, 3),
+                            "reason": "Low-frequency naming pattern in this view type.",
+                        }
+                    )
+                    group_summary["outlier_count"] += 1
+
+        groups.append(group_summary)
+
+    record = {
+        "created_at": services.result_store._now_timestamp(),
+        "filters": {
+            "view_type_filter": sorted(list(allowed_types)) if allowed_types else [],
+            "min_group_size": int(min_group_size),
+            "outlier_similarity_threshold": float(outlier_similarity_threshold),
+        },
+        "views_total": len(working_views),
+        "groups": groups,
+        "outliers": outliers,
+    }
+    analysis_handle = services.result_store.store_view_analysis(record)
+
+    outlier_sample_limit = max(10, services.config.max_outliers_in_response)
+    result_payload = {
+        "status": "success",
+        "message": "Analyzed {} views across {} view-type groups; detected {} outliers.".format(
+            len(working_views),
+            len(groups),
+            len(outliers),
+        ),
+        "analysis_handle": analysis_handle,
+        "count": len(working_views),
+        "groups": groups,
+        "outliers_sample": outliers[:outlier_sample_limit],
+        "outliers_total": len(outliers),
+        "outliers_truncated": len(outliers) > outlier_sample_limit,
+    }
+    return services.result_store.compact_result_payload(
+        result_payload,
+        preserve_keys=["analysis_handle", "status", "message", "count", "outliers_total", "outliers_truncated"],
+    )
+
+
+def analyze_view_naming_patterns_handler(
+    services,
+    view_type_filter: list[str] = None,
+    min_group_size: int = 6,
+    outlier_similarity_threshold: float = 0.72,
+    **_kwargs,
+) -> dict:
+    services.logger.info(
+        "MCP Tool executed: %s (view_type_filter=%s, min_group_size=%s, outlier_similarity_threshold=%s)",
+        ANALYZE_VIEW_NAMING_PATTERNS_TOOL_NAME,
+        view_type_filter,
+        min_group_size,
+        outlier_similarity_threshold,
+    )
+    try:
+        safe_group_size = max(3, min(30, int(min_group_size or 6)))
+    except Exception:
+        safe_group_size = 6
+
+    try:
+        safe_threshold = float(outlier_similarity_threshold if outlier_similarity_threshold is not None else 0.72)
+    except Exception:
+        safe_threshold = 0.72
+    safe_threshold = max(0.45, min(0.95, safe_threshold))
+
+    return analyze_view_naming_patterns_internal(
+        services,
+        view_type_filter=view_type_filter or [],
+        min_group_size=safe_group_size,
+        outlier_similarity_threshold=safe_threshold,
+    )
+
+
+def suggest_view_name_corrections_handler(
+    services,
+    analysis_handle: str,
+    max_suggestions: int = 100,
+    min_confidence: float = 0.6,
+    **_kwargs,
+) -> dict:
+    services.logger.info(
+        "MCP Tool executed: %s (analysis_handle=%s, max_suggestions=%s, min_confidence=%s)",
+        SUGGEST_VIEW_NAME_CORRECTIONS_TOOL_NAME,
+        analysis_handle,
+        max_suggestions,
+        min_confidence,
+    )
+
+    record = services.result_store.get_view_analysis(analysis_handle)
+    if not record:
+        return {"status": "error", "message": "Unknown analysis_handle '{}'".format(analysis_handle)}
+
+    try:
+        safe_max = max(1, min(300, int(max_suggestions or 100)))
+    except Exception:
+        safe_max = 100
+
+    try:
+        safe_min_confidence = max(0.0, min(1.0, float(min_confidence if min_confidence is not None else 0.6)))
+    except Exception:
+        safe_min_confidence = 0.6
+
+    outliers = record.get("outliers", []) or []
+    suggestions = []
+    for outlier in outliers:
+        current_name = outlier.get("name", "")
+        exemplar = outlier.get("nearest_example", "")
+        if not current_name or not exemplar:
+            continue
+
+        suggested_name = _apply_view_style_from_exemplar(current_name, exemplar)
+        similarity = float(outlier.get("similarity_to_nearest", 0.0))
+        confidence = round(max(0.0, min(0.99, similarity + 0.2)), 3)
+        if confidence < safe_min_confidence:
+            continue
+        if suggested_name == current_name:
+            continue
+
+        suggestions.append(
+            {
+                "view_id": outlier.get("view_id"),
+                "view_type": outlier.get("view_type"),
+                "current_name": current_name,
+                "suggested_name": suggested_name,
+                "confidence": confidence,
+                "reason": "Aligned casing/separator style with nearest in-group naming pattern.",
+                "nearest_example": exemplar,
+            }
+        )
+
+        if len(suggestions) >= safe_max:
+            break
+
+    result_payload = {
+        "status": "success",
+        "analysis_handle": analysis_handle,
+        "suggestion_count": len(suggestions),
+        "suggestions": suggestions,
+        "message": "Generated {} rename suggestions from {} analyzed outliers.".format(
+            len(suggestions),
+            len(outliers),
+        ),
+    }
+    return services.result_store.compact_result_payload(
+        result_payload,
+        preserve_keys=["status", "analysis_handle", "suggestion_count", "message"],
+    )
+
+
+def build_view_tools() -> list[ToolDefinition]:
+    return [
+        ToolDefinition(
+            name=GET_ACTIVE_VIEW_INFO_TOOL_NAME,
+            description=(
+                "Returns metadata for the active Revit view, including name, type, scale, printability, and "
+                "associated level when available."
+            ),
+            json_schema={"type": "object", "properties": {}},
+            handler=get_active_view_info_handler,
+        ),
+        ToolDefinition(
+            name=GET_ACTIVE_VIEW_ELEMENTS_TOOL_NAME,
+            description=(
+                "Returns a bounded snapshot of elements visible in the active Revit view. Optionally filter by "
+                "category names. Successful results are stored for follow-on selection or property reads."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "category_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional category names to keep in the active-view scan.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of matching elements to return and store from the active view.",
+                    },
+                },
+            },
+            handler=get_active_view_elements_handler,
+        ),
+        ToolDefinition(
+            name=PLACE_VIEW_ON_SHEET_TOOL_NAME,
+            description=(
+                "Places a view onto a new sheet by view name. Creates a new sheet with automatic numbering based on "
+                "view type and places the view in the center of the sheet. Supports fuzzy matching for view names "
+                "when exact_match=False."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "view_name": {"type": "string", "description": "Name of the view to place on the sheet."},
+                    "exact_match": {"type": "boolean", "description": "Whether to require exact view name match."},
+                },
+                "required": ["view_name"],
+            },
+            handler=place_view_on_sheet_handler,
+        ),
+        ToolDefinition(
+            name=LIST_VIEWS_TOOL_NAME,
+            description=(
+                "Lists all views in the current document that can be placed on sheets. Returns view names, types, "
+                "IDs, and whether they're already placed on sheets. Use this to discover available views before "
+                "placing them."
+            ),
+            json_schema={"type": "object", "properties": {}},
+            handler=list_views_handler,
+        ),
+        ToolDefinition(
+            name=ANALYZE_VIEW_NAMING_PATTERNS_TOOL_NAME,
+            description="Dynamically analyzes view naming patterns by clustering names per view type and identifying likely outliers.",
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "view_type_filter": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of view types to limit analysis scope.",
+                    },
+                    "min_group_size": {
+                        "type": "integer",
+                        "description": "Minimum views in a type-group before outlier detection is applied.",
+                    },
+                    "outlier_similarity_threshold": {
+                        "type": "number",
+                        "description": "Similarity threshold (0-1) for outlier detection.",
+                    },
+                },
+            },
+            handler=analyze_view_naming_patterns_handler,
+        ),
+        ToolDefinition(
+            name=SUGGEST_VIEW_NAME_CORRECTIONS_TOOL_NAME,
+            description="Generates rename suggestions for outlier views from a previous naming analysis.",
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "analysis_handle": {
+                        "type": "string",
+                        "description": "Required handle returned by analyze_view_naming_patterns.",
+                    },
+                    "max_suggestions": {
+                        "type": "integer",
+                        "description": "Maximum number of suggestions to return.",
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Minimum confidence (0-1) for returned suggestions.",
+                    },
+                },
+                "required": ["analysis_handle"],
+            },
+            handler=suggest_view_name_corrections_handler,
+        ),
+    ]
