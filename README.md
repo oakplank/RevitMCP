@@ -6,25 +6,34 @@ RevitMCP (Revit Model Content Protocol) is a pyRevit extension that allows exter
 
 ## Key Features
 
-- **Element Selection and Filtering:** Find and select elements by category, properties, or custom filters
-- **Project Information Access:** Retrieve project metadata and document properties  
-- **Element Parameter Management:** Read and update element parameters with type validation
-- **Sheet and View Management:** Automatically place views on new sheets with smart numbering
-- **Natural Language Integration:** Compatible with AI assistants for intuitive Revit automation
+- **Schema-aware automation:** Load canonical Revit context for levels, categories, families, types, and parameters before acting
+- **Element search and selection:** Retrieve, filter, store, and re-select result sets without pushing large ID lists through the model
+- **Parameter read/write workflows:** Inspect populated properties and update instance or type parameters with validation
+- **Sheet and view tooling:** List placeable views, auto-create sheets, and place views with smart numbering
+- **AI-native operation:** Available through both the local web UI and the MCP stdio surface for desktop AI assistants
 
-## New: Sheet Placement Tool
+## MCP Tool Catalog
 
-The latest feature allows you to place views onto sheets using simple commands like:
-- "Place detail foundation onto a sheet"
-- "Put section A-A on a new sheet"
+The current RevitMCP server exposes the following user-facing tools:
 
-The tool automatically:
-- Finds views by name (fuzzy matching)
-- Creates new sheets with appropriate numbering (D001, S001, etc.)
-- Places views in the center of sheets
-- Handles titleblock selection and viewport creation
-
-See `RevitMCP.extension/lib/RevitMCP_Tools/sheet_placement_tool.py` and `RevitMCP.extension/lib/routes/sheet_routes.py` for implementation details.
+| Tool | Description |
+| --- | --- |
+| `get_revit_project_info` | Get active project metadata, document path, and Revit version details |
+| `get_revit_schema_context` | Load canonical Revit schema context including levels, categories, families, types, and common parameters |
+| `resolve_revit_targets` | Resolve user terms to exact Revit category, level, family, type, and parameter names |
+| `get_elements_by_category` | Retrieve all elements for a category and store the result for follow-on actions |
+| `select_elements_by_id` | Select elements by explicit IDs or a stored result handle; retained for compatibility |
+| `select_stored_elements` | Select a previously stored search or filter result inside Revit |
+| `list_stored_elements` | List stored element result sets and their counts currently available on the server |
+| `filter_elements` | Find elements by category, level, and parameter-based conditions |
+| `filter_stored_elements_by_parameter` | Refine a stored result set with batched server-side parameter filtering |
+| `get_element_properties` | Read parameter values for specific elements or an existing result handle |
+| `update_element_parameters` | Update one or many element parameters with typed value handling |
+| `place_view_on_sheet` | Create a new sheet, auto-number it, and place a matched view on it |
+| `list_views` | List views that can be placed on sheets, including type and placement status |
+| `analyze_view_naming_patterns` | Cluster view names by type and flag likely naming outliers |
+| `suggest_view_name_corrections` | Generate rename suggestions from a prior view naming analysis |
+| `plan_and_execute_workflow` | Execute a multi-step Revit workflow from a structured tool plan |
 
 This README provides instructions on how to set up and use the `RevitMCP.extension`.
 
