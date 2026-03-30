@@ -5,6 +5,18 @@ from RevitMCP_ExternalServer.providers.types import ProviderResult
 from RevitMCP_ExternalServer.tools.planning_tools import build_planning_system_prompt
 
 
+def _infer_provider_from_model_name(model_name: str) -> str:
+    if model_name == "echo_model":
+        return "echo"
+    if model_name.startswith("gpt-") or model_name.startswith("o"):
+        return "openai"
+    if model_name.startswith("claude-"):
+        return "anthropic"
+    if model_name.startswith("gemini-"):
+        return "google"
+    return ""
+
+
 def run_chat_request(
     services,
     tool_registry,
@@ -18,14 +30,15 @@ def run_chat_request(
     conversation_history = data.get("conversation") or []
     api_key = data.get("apiKey")
     selected_model_ui_name = data.get("model") or ""
+    selected_provider = data.get("provider") or _infer_provider_from_model_name(selected_model_ui_name)
     planning_system_prompt = build_planning_system_prompt(tool_registry)
 
     execute_tool_call = lambda tool_name, function_args: tool_registry.dispatch(services, tool_name, function_args)
 
-    if selected_model_ui_name == "echo_model":
+    if selected_provider == "echo" or selected_model_ui_name == "echo_model":
         last_user_message = conversation_history[-1]["content"] if conversation_history else ""
         provider_result = ProviderResult(reply=f"Echo: {last_user_message}")
-    elif selected_model_ui_name.startswith("gpt-") or selected_model_ui_name.startswith("o"):
+    elif selected_provider == "openai":
         provider_result = run_openai_chat(
             conversation_history=conversation_history,
             system_prompt=planning_system_prompt,
@@ -37,7 +50,7 @@ def run_chat_request(
             max_tool_iterations=services.config.max_tool_iterations,
             client_factory=openai_client_factory,
         )
-    elif selected_model_ui_name.startswith("claude-"):
+    elif selected_provider == "anthropic":
         actual_model_id = services.config.anthropic_model_id_map.get(selected_model_ui_name, selected_model_ui_name)
         provider_result = run_anthropic_chat(
             conversation_history=conversation_history,
@@ -50,7 +63,7 @@ def run_chat_request(
             max_tool_iterations=services.config.max_tool_iterations,
             client_factory=anthropic_client_factory,
         )
-    elif selected_model_ui_name.startswith("gemini-"):
+    elif selected_provider == "google":
         provider_result = run_google_chat(
             conversation_history=conversation_history,
             system_prompt=planning_system_prompt,
@@ -66,7 +79,7 @@ def run_chat_request(
     else:
         provider_result = ProviderResult(
             reply="",
-            error_detail="Model '{}' is not recognized or supported.".format(selected_model_ui_name),
+            error_detail="Model '{}' with provider '{}' is not recognized or supported.".format(selected_model_ui_name, selected_provider or "unknown"),
         )
 
     response_payload = {"reply": provider_result.reply}
@@ -75,4 +88,3 @@ def run_chat_request(
     if provider_result.error_detail:
         response_payload["error_detail"] = provider_result.error_detail
     return response_payload, 200
-

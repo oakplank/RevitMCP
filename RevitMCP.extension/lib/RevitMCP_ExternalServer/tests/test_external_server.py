@@ -12,11 +12,12 @@ if str(LIB_ROOT) not in sys.path:
 
 
 from RevitMCP_ExternalServer.bootstrap import create_application
-from RevitMCP_ExternalServer.core.runtime_config import ANTHROPIC_MODEL_ID_MAP, resolve_runtime_surface
+from RevitMCP_ExternalServer.core.runtime_config import resolve_runtime_surface
 from RevitMCP_ExternalServer.providers.anthropic_provider import run_anthropic_chat
 from RevitMCP_ExternalServer.providers.google_provider import run_google_chat
 from RevitMCP_ExternalServer.providers.openai_provider import run_openai_chat
 from RevitMCP_ExternalServer.tools.registry import build_tool_registry
+from RevitMCP_ExternalServer.web.chat_service import run_chat_request
 
 
 class BootstrapTests(unittest.TestCase):
@@ -236,6 +237,58 @@ class WebRouteTests(unittest.TestCase):
         self.assertIn("/send_revit_command", registered_routes)
 
 
+class ChatServiceTests(unittest.TestCase):
+    def test_explicit_provider_routes_custom_openai_model(self):
+        app, _mcp_server, services, registry = create_application(
+            launch_background_tasks=False,
+            detect_revit_on_startup=False,
+        )
+
+        class FakeOpenAIClient:
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+            def create(self, **_kwargs):
+                message = SimpleNamespace(content="openai explicit ok", tool_calls=[])
+                return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+        response_payload, status_code = run_chat_request(
+            services,
+            registry,
+            {
+                "conversation": [{"role": "user", "content": "test"}],
+                "model": "custom-openai-model",
+                "provider": "openai",
+                "apiKey": "key",
+            },
+            openai_client_factory=FakeOpenAIClient,
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(response_payload["reply"], "openai explicit ok")
+
+    def test_unknown_provider_returns_error(self):
+        app, _mcp_server, services, registry = create_application(
+            launch_background_tasks=False,
+            detect_revit_on_startup=False,
+        )
+
+        response_payload, status_code = run_chat_request(
+            services,
+            registry,
+            {
+                "conversation": [{"role": "user", "content": "test"}],
+                "model": "custom-model",
+                "provider": "not-real",
+                "apiKey": "key",
+            },
+        )
+
+        self.assertIsNotNone(app)
+        self.assertEqual(status_code, 500)
+        self.assertIn("provider 'not-real'", response_payload["error"])
+
+
 class CompatibilityTests(unittest.TestCase):
     def test_resolve_runtime_surface_precedence(self):
         with patch.dict(os.environ, {"REVITMCP_SURFACE": "mcp"}):
@@ -244,10 +297,6 @@ class CompatibilityTests(unittest.TestCase):
 
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(resolve_runtime_surface([]), "web")
-
-    def test_legacy_anthropic_model_aliases(self):
-        self.assertEqual(ANTHROPIC_MODEL_ID_MAP["claude-4-sonnet"], "claude-sonnet-4-6")
-        self.assertEqual(ANTHROPIC_MODEL_ID_MAP["claude-4-opus"], "claude-opus-4-6")
 
 
 if __name__ == "__main__":

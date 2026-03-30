@@ -19,10 +19,6 @@ ANTHROPIC_MODEL_ID_MAP = {
     "claude-sonnet-4-6": "claude-sonnet-4-6",
     "claude-opus-4-6": "claude-opus-4-6",
     "claude-haiku-4-5": "claude-haiku-4-5",
-    "claude-4-sonnet": "claude-sonnet-4-6",
-    "claude-4-opus": "claude-opus-4-6",
-    "claude-3-7-sonnet": "claude-3-7-sonnet-20250219",
-    "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
 }
 
 

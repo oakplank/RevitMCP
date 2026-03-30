@@ -300,6 +300,27 @@
             padding-bottom: 10px;
         }
 
+        .settings-intro {
+            margin: 0 0 18px;
+            color: #4b5563;
+            font-size: 0.95em;
+            line-height: 1.5;
+        }
+
+        .settings-section {
+            margin-top: 16px;
+            padding: 16px;
+            border: 1px solid #e5e7eb;
+            border-radius: 10px;
+            background-color: #f9fafb;
+        }
+
+        .settings-section h3 {
+            margin: 0 0 10px;
+            font-size: 1em;
+            color: #1f2937;
+        }
+
         .modal-content label {
             display: block;
             margin-top: 15px;
@@ -307,22 +328,49 @@
             font-weight: bold;
         }
 
-        .modal-content input[type="password"], .modal-content input[type="text"] {
+        .modal-content input[type="password"], .modal-content input[type="text"], .modal-content select {
             width: calc(100% - 22px); /* Full width minus padding and border */
             padding: 10px;
             margin-bottom: 15px;
             border: 1px solid #ccc;
             border-radius: 4px;
+            background-color: #fff;
         }
 
-        .modal-buttons {
+        .settings-helper {
+            margin: -8px 0 12px;
+            color: #6b7280;
+            font-size: 0.85em;
+            line-height: 1.45;
+        }
+
+        .settings-toggle-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-top: 14px;
+        }
+
+        .settings-toggle-row label {
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+            color: #334155;
+        }
+
+        .settings-toggle-row input[type="checkbox"] {
+            margin: 0;
+        }
+
+        .settings-actions {
             display: flex;
             justify-content: flex-end;
-            gap: 10px;
             margin-top: 20px;
         }
 
-        .modal-buttons button {
+        .settings-actions button {
             padding: 10px 20px;
             border-radius: 5px;
             border: none;
@@ -335,6 +383,13 @@
         }
         #save-settings-button:hover {
             background-color: #0056b3;
+        }
+
+        .settings-status {
+            min-height: 1.2em;
+            margin: 12px 0 0;
+            color: #1362bb;
+            font-size: 0.9em;
         }
 
         #cancel-settings-button {
@@ -448,19 +503,19 @@
                 <div id="controls">
                     <label for="model-selector">Model:</label>
                     <select id="model-selector">
-                        <option value="echo_model">Echo Model (Test)</option>
+                        <option value="echo_model" data-provider="echo">Echo Model (Test)</option>
                         <optgroup label="OpenAI">
-                            <option value="gpt-5.2">GPT-5.2</option>
-                            <option value="gpt-5-mini">GPT-5 mini</option>
+                            <option value="gpt-5.4" data-provider="openai">GPT-5.4</option>
+                            <option value="gpt-5.4-mini" data-provider="openai">GPT-5.4 mini</option>
                         </optgroup>
                         <optgroup label="Anthropic">
-                            <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-                            <option value="claude-opus-4-6">claude-opus-4-6</option>
-                            <option value="claude-haiku-4-5">claude-haiku-4-5</option>
+                            <option value="claude-sonnet-4-6" data-provider="anthropic">claude-sonnet-4-6</option>
+                            <option value="claude-opus-4-6" data-provider="anthropic">claude-opus-4-6</option>
+                            <option value="claude-haiku-4-5" data-provider="anthropic">claude-haiku-4-5</option>
                         </optgroup>
                         <optgroup label="Google Gemini">
-                            <option value="gemini-3-pro-preview-02-05">Gemini 3 Pro (Preview)</option>
-                            <option value="gemini-3-flash-preview-02-05">Gemini 3 Flash (Preview)</option>
+                            <option value="gemini-3.1-pro" data-provider="google">Gemini 3.1 Pro</option>
+                            <option value="gemini-3.1-flash-lite" data-provider="google">Gemini 3.1 Flash-Lite</option>
                         </optgroup>
                     </select>
                     <!-- API Key input removed from here -->
@@ -482,22 +537,53 @@
         <div class="modal-content">
             <span class="close-button" onclick="closeSettingsModal()">&times;</span>
             <h2>Settings</h2>
-            
-            <label for="openai-api-key">OpenAI API Key:</label>
-            <input type="password" id="openai-api-key" name="openai-api-key">
+            <p class="settings-intro">API keys are stored locally in this browser profile on your machine. Add only the providers you plan to use.</p>
 
-            <label for="anthropic-api-key">Anthropic API Key:</label>
-            <input type="password" id="anthropic-api-key" name="anthropic-api-key">
+            <div class="settings-section">
+                <h3>Model Selection</h3>
+                <label for="preferred-model">Preset Model:</label>
+                <select id="preferred-model" name="preferred-model">
+                    <!-- Options will be populated by JavaScript -->
+                </select>
 
-            <label for="google-api-key">Google API Key:</label>
-            <input type="password" id="google-api-key" name="google-api-key">
+                <label for="custom-model-id">Custom Model ID:</label>
+                <input type="text" id="custom-model-id" name="custom-model-id" placeholder="gpt-5.4, claude-opus-4-6, gemini-3.1-pro">
+                <label for="custom-model-provider">Custom Model Provider:</label>
+                <select id="custom-model-provider" name="custom-model-provider">
+                    <option value="openai">OpenAI</option>
+                    <option value="anthropic">Anthropic</option>
+                    <option value="google">Google</option>
+                </select>
+                <p id="custom-model-help" class="settings-helper">Optional. If filled in, this custom model is added to the selector and uses the provider you select here.</p>
+            </div>
 
-            <label for="preferred-model">Preferred Model:</label>
-            <select id="preferred-model" name="preferred-model">
-                <!-- Options will be populated by JavaScript -->
-            </select>
-            <button onclick="saveSettings()">Save Settings</button>
-            <p id="settings-status"></p>
+            <div class="settings-toggle-row">
+                <label for="show-api-keys">
+                    <input type="checkbox" id="show-api-keys" name="show-api-keys">
+                    Show API keys
+                </label>
+            </div>
+
+            <div class="settings-section">
+                <h3>API Keys</h3>
+
+                <label for="openai-api-key">OpenAI API Key:</label>
+                <input type="password" id="openai-api-key" name="openai-api-key" placeholder="sk-...">
+                <p class="settings-helper">Used for OpenAI models.</p>
+
+                <label for="anthropic-api-key">Anthropic API Key:</label>
+                <input type="password" id="anthropic-api-key" name="anthropic-api-key" placeholder="sk-ant-...">
+                <p class="settings-helper">Used for Claude models.</p>
+
+                <label for="google-api-key">Google API Key:</label>
+                <input type="password" id="google-api-key" name="google-api-key" placeholder="AIza...">
+                <p class="settings-helper">Used for Gemini models.</p>
+            </div>
+
+            <div class="settings-actions">
+                <button id="save-settings-button" onclick="saveSettings()">Save Settings</button>
+            </div>
+            <p id="settings-status" class="settings-status"></p>
         </div>
     </div>
 
@@ -518,7 +604,12 @@
         const anthropicApiKeyInput = document.getElementById('anthropic-api-key');
         const googleApiKeyInput = document.getElementById('google-api-key');
         const preferredModelSelect = document.getElementById('preferred-model');
+        const customModelInput = document.getElementById('custom-model-id');
+        const customModelProviderSelect = document.getElementById('custom-model-provider');
+        const customModelHelp = document.getElementById('custom-model-help');
+        const showApiKeysCheckbox = document.getElementById('show-api-keys');
         const settingsStatus = document.getElementById('settings-status');
+        const defaultModelOptionsMarkup = modelSelector.innerHTML;
 
         // New top bar buttons
         const topBarToggleSidebarButton = document.getElementById('top-bar-toggle-sidebar');
@@ -566,30 +657,132 @@
             // Connect new top-bar new chat button
             topBarNewChatButton.addEventListener('click', startNewChat);
 
-            // Load last selected model
-            const savedModel = localStorage.getItem('revitMCPselectedModel');
-            if (savedModel) {
+            const savedModel = localStorage.getItem('revitMCPselectedModel') || '';
+            const savedCustomModel = localStorage.getItem('revitMCP_custom_model_id') || '';
+            const savedCustomProvider = localStorage.getItem('revitMCP_custom_model_provider') || inferProviderIdFromModel(savedCustomModel) || 'openai';
+            const initialCustomModel = savedCustomModel || (savedModel && !hasModelOption(modelSelector, savedModel) ? savedModel : '');
+            if (initialCustomModel && !savedCustomModel) {
+                localStorage.setItem('revitMCP_custom_model_id', initialCustomModel);
+                localStorage.setItem('revitMCP_custom_model_provider', inferProviderIdFromModel(initialCustomModel) || 'openai');
+            }
+            refreshModelSelectors(initialCustomModel, savedCustomProvider);
+
+            if (savedModel && hasModelOption(modelSelector, savedModel)) {
                 modelSelector.value = savedModel;
+            } else if (initialCustomModel && hasModelOption(modelSelector, initialCustomModel)) {
+                modelSelector.value = initialCustomModel;
             }
         });
 
         // --- Settings Modal Logic --- (listeners can be set up outside DOMContentLoaded)
+        function hasModelOption(selectElement, modelValue) {
+            return Array.from(selectElement.options).some(option => option.value === modelValue);
+        }
+
+        function addCustomModelOption(selectElement, customModel, customProvider) {
+            const normalizedModel = (customModel || '').trim();
+            if (!normalizedModel || hasModelOption(selectElement, normalizedModel)) {
+                return;
+            }
+
+            let customGroup = Array.from(selectElement.querySelectorAll('optgroup')).find(group => group.label === 'Custom');
+            if (!customGroup) {
+                customGroup = document.createElement('optgroup');
+                customGroup.label = 'Custom';
+                selectElement.appendChild(customGroup);
+            }
+
+            const customOption = document.createElement('option');
+            customOption.value = normalizedModel;
+            customOption.textContent = normalizedModel + ' (Custom)';
+            customOption.dataset.provider = customProvider || 'openai';
+            customGroup.appendChild(customOption);
+        }
+
+        function refreshModelSelectors(customModel, customProvider) {
+            [modelSelector, preferredModelSelect].forEach(selectElement => {
+                selectElement.innerHTML = defaultModelOptionsMarkup;
+                addCustomModelOption(selectElement, customModel, customProvider);
+            });
+        }
+
+        function getProviderLabel(providerId) {
+            if (providerId === 'openai') return 'OpenAI';
+            if (providerId === 'anthropic') return 'Anthropic';
+            if (providerId === 'google') return 'Google';
+            return '';
+        }
+
+        function inferProviderIdFromModel(modelName) {
+            if (!modelName) return '';
+            if (modelName.startsWith('gpt-') || /^o\d/.test(modelName)) return 'openai';
+            if (modelName.startsWith('claude-')) return 'anthropic';
+            if (modelName.startsWith('gemini-')) return 'google';
+            return '';
+        }
+
+        function getSelectedProviderId(selectElement) {
+            const selectedOption = selectElement.options[selectElement.selectedIndex];
+            return selectedOption ? (selectedOption.dataset.provider || '') : '';
+        }
+
+        function getApiKeyForProvider(providerId) {
+            if (providerId === 'openai') {
+                return localStorage.getItem('revitMCP_openai_api_key') || '';
+            }
+            if (providerId === 'anthropic') {
+                return localStorage.getItem('revitMCP_anthropic_api_key') || '';
+            }
+            if (providerId === 'google') {
+                return localStorage.getItem('revitMCP_google_api_key') || '';
+            }
+            return '';
+        }
+
+        function updateCustomModelHelp() {
+            const customModel = customModelInput.value.trim();
+            if (!customModel) {
+                customModelHelp.textContent = 'Optional. If filled in, this custom model is added to the selector and uses the provider you select here.';
+                return;
+            }
+
+            const providerName = getProviderLabel(customModelProviderSelect.value);
+            if (providerName) {
+                customModelHelp.textContent = providerName + ' selected. This model will use your ' + providerName + ' API key.';
+            } else {
+                customModelHelp.textContent = 'Select the provider for this custom model so the right backend and API key are used.';
+            }
+        }
+
+        function applyApiKeyVisibility() {
+            const inputType = showApiKeysCheckbox.checked ? 'text' : 'password';
+            [openaiApiKeyInput, anthropicApiKeyInput, googleApiKeyInput].forEach(inputElement => {
+                inputElement.type = inputType;
+            });
+        }
+
         function openSettingsModal() {
             // Load current settings into the modal inputs
             openaiApiKeyInput.value = localStorage.getItem('revitMCP_openai_api_key') || '';
             anthropicApiKeyInput.value = localStorage.getItem('revitMCP_anthropic_api_key') || '';
             googleApiKeyInput.value = localStorage.getItem('revitMCP_google_api_key') || '';
-            
-            // Populate the preferred model selector by copying options from the main model selector
-            preferredModelSelect.innerHTML = modelSelector.innerHTML;
-            // Set the selected value for the preferred model
+
+            const savedCustomModel = localStorage.getItem('revitMCP_custom_model_id') || '';
+            const savedCustomProvider = localStorage.getItem('revitMCP_custom_model_provider') || inferProviderIdFromModel(savedCustomModel) || 'openai';
+            customModelInput.value = savedCustomModel;
+            customModelProviderSelect.value = savedCustomProvider;
+            refreshModelSelectors(savedCustomModel, savedCustomProvider);
+
             const savedPreferredModel = localStorage.getItem('revitMCPselectedModel');
-            if (savedPreferredModel) {
+            if (savedPreferredModel && hasModelOption(preferredModelSelect, savedPreferredModel)) {
                 preferredModelSelect.value = savedPreferredModel;
             } else if (modelSelector.options.length > 0) {
-                preferredModelSelect.value = modelSelector.options[0].value; // Default to first option of main selector
+                preferredModelSelect.value = modelSelector.options[0].value;
             }
 
+            showApiKeysCheckbox.checked = false;
+            applyApiKeyVisibility();
+            updateCustomModelHelp();
             settingsModal.style.display = 'block';
             settingsStatus.textContent = '';
         }
@@ -602,13 +795,23 @@
             localStorage.setItem('revitMCP_openai_api_key', openaiApiKeyInput.value.trim());
             localStorage.setItem('revitMCP_anthropic_api_key', anthropicApiKeyInput.value.trim());
             localStorage.setItem('revitMCP_google_api_key', googleApiKeyInput.value.trim());
-            localStorage.setItem('revitMCPselectedModel', preferredModelSelect.value);
-            
-            settingsStatus.textContent = 'Settings saved!';
-            // Update the main model selector as well if the preferred model changed
-            // populateModelSelector(modelSelector, true); // No longer needed, main selector is static
-            modelSelector.value = preferredModelSelect.value;
-            
+            const customModel = customModelInput.value.trim();
+            const customProvider = customModelProviderSelect.value || 'openai';
+            if (customModel) {
+                localStorage.setItem('revitMCP_custom_model_id', customModel);
+                localStorage.setItem('revitMCP_custom_model_provider', customProvider);
+            } else {
+                localStorage.removeItem('revitMCP_custom_model_id');
+                localStorage.removeItem('revitMCP_custom_model_provider');
+            }
+
+            refreshModelSelectors(customModel, customProvider);
+            const selectedModel = customModel || preferredModelSelect.value;
+            localStorage.setItem('revitMCPselectedModel', selectedModel);
+             
+            settingsStatus.textContent = 'Settings saved locally in this browser.';
+            modelSelector.value = selectedModel;
+             
             setTimeout(() => {
                 closeSettingsModal();
             }, 1000);
@@ -620,6 +823,15 @@
         }
         if (closeSettingsModalButton) {
             closeSettingsModalButton.addEventListener('click', closeSettingsModal);
+        }
+        if (customModelInput) {
+            customModelInput.addEventListener('input', updateCustomModelHelp);
+        }
+        if (customModelProviderSelect) {
+            customModelProviderSelect.addEventListener('change', updateCustomModelHelp);
+        }
+        if (showApiKeysCheckbox) {
+            showApiKeysCheckbox.addEventListener('change', applyApiKeyVisibility);
         }
         // saveSettings is called by button onclick directly in HTML
 
@@ -849,13 +1061,15 @@
             displayMessage('user', messageText);
             
             const selectedModelValue = modelSelector.value;
-            let apiKeyToUse = getApiKeyForModel(selectedModelValue); // Use existing helper
+            const selectedProvider = getSelectedProviderId(modelSelector);
+            let apiKeyToUse = getApiKeyForProvider(selectedProvider);
 
             // No longer need special parsing for /get_view, LLM handles it.
             
             const payload = {
                 conversation: [...currentConversation], // currentConversation includes the new user message from displayMessage
                 model: selectedModelValue,
+                provider: selectedProvider,
                 apiKey: apiKeyToUse // This will be the specific key for the selected model's provider
             };
             
@@ -999,20 +1213,6 @@
                 }
                 statusDiv.textContent = `Chat '${chatTitle}' deleted.`;
             }
-        }
-
-        function getApiKeyForModel(modelName) {
-            if (!modelName) return ''; // Should not happen if a model is always selected
-
-            if (modelName.startsWith('gpt-') || /^o\d/.test(modelName)) {
-                return localStorage.getItem('revitMCP_openai_api_key') || '';
-            } else if (modelName.startsWith('claude-')) {
-                return localStorage.getItem('revitMCP_anthropic_api_key') || '';
-            } else if (modelName.startsWith('gemini-')) {
-                return localStorage.getItem('revitMCP_google_api_key') || '';
-            }
-            // For 'echo_model' or any other model not matching known prefixes, no API key is needed by the backend.
-            return ''; 
         }
 
     </script>
