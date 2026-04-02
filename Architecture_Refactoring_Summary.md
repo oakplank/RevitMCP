@@ -1,5 +1,7 @@
 # RevitMCP Architecture Refactoring Summary
 
+Historical note: this document references the older nested `RevitMCP.extension/` wrapper layout. The current repository is flattened and repo root now acts as the extension root.
+
 ## What We Did
 
 Successfully refactored the monolithic 1500-line `startup.py` into a clean, modular architecture.

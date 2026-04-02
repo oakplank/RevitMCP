@@ -1,4 +1,4 @@
-# RevitMCP.extension/startup.py - Lightweight coordinator
+# startup.py - Lightweight coordinator
 
 from pyrevit import routes, script
 from pyrevit import DB
@@ -6,7 +6,7 @@ import sys
 import os
 
 logger = script.get_logger()
-logger.info("RevitMCP.extension startup script executing...")
+logger.info("RevitMCP startup script executing...")
 
 try:
     # Initialize API namespace
@@ -79,6 +79,6 @@ try:
     logger.info("All route modules loaded successfully")
 
 except Exception as e:
-    logger.error("Error during RevitMCP.extension startup.py execution: {}".format(e), exc_info=True)
+    logger.error("Error during RevitMCP startup.py execution: {}".format(e), exc_info=True)
 
-logger.info("RevitMCP.extension startup script finished.") 
+logger.info("RevitMCP startup script finished.") 

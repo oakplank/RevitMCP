@@ -42,3 +42,6 @@ roadmap.md
 dist/
 build/
 *.egg-info/ 
+
+# Local test scratch data
+lib/_tmp_testdata/

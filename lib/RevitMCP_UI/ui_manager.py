@@ -17,7 +17,7 @@ import datetime # Added for timestamps in settings
 
 # --- Configuration ---
 
-# When this script (ui_manager.py) is in MyRevitMCP.extension/lib/RevitMCP_UI/,
+# When this script (ui_manager.py) is in <ExtensionRoot>/lib/RevitMCP_UI/,
 # __file__ is .../lib/RevitMCP_UI/ui_manager.py
 # os.path.dirname(__file__) is .../lib/RevitMCP_UI/
 # We need to get to .../lib/RevitMCP_ExternalServer/server.py

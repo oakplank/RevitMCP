@@ -1,4 +1,4 @@
-# RevitMCP.extension/startup.py
+# startup.py
 
 from pyrevit import routes
 from pyrevit import script
@@ -7,7 +7,7 @@ from System.Collections.Generic import List # Add this import for .NET List
 # from Autodesk.Revit.DB import * # Alternative direct Revit API import
 
 logger = script.get_logger()
-logger.info("RevitMCP.extension startup script executing...")
+logger.info("RevitMCP startup script executing...")
 
 try:
     # Define an API namespace. This should match the one your external server is calling.
@@ -1470,6 +1470,6 @@ try:
     logger.info("Route /sheets/list_views for API 'revit-mcp-v1' defined in startup.py.")
 
 except Exception as e:
-    logger.error("Error during RevitMCP.extension startup.py execution (API/route definition): {}".format(e), exc_info=True)
+    logger.error("Error during RevitMCP startup.py execution (API/route definition): {}".format(e), exc_info=True)
 
-logger.info("RevitMCP.extension startup script finished.") 
+logger.info("RevitMCP startup script finished.") 

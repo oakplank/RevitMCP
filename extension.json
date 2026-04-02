@@ -1,0 +1,14 @@
+{
+  "builtin": "False",
+  "default_enabled": "True",
+  "type": "extension",
+  "rocket_mode_compatible": "False",
+  "name": "RevitMCP",
+  "description": "AI-enabled pyRevit extension plus companion server for working against a live Revit session.",
+  "author": "OakPlank",
+  "author_profile": "https://github.com/oakplank",
+  "url": "https://github.com/oakplank/RevitMCP.git",
+  "website": "https://github.com/oakplank/RevitMCP",
+  "image": "",
+  "dependencies": []
+}
