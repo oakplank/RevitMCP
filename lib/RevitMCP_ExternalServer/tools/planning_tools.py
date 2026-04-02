@@ -14,14 +14,14 @@ def _tool_params_summary(tool_schema: dict) -> str:
     return "params: {}".format(", ".join(properties))
 
 
-def build_planning_system_prompt(tool_registry) -> str:
+def build_planning_system_prompt(tool_registry, memory_context: str = "") -> str:
     tool_lines = []
     for definition in tool_registry.list_definitions():
         if definition.name == PLANNER_TOOL_NAME:
             continue
         tool_lines.append("- {}: {}".format(definition.name, _tool_params_summary(definition.json_schema)))
 
-    return """You are a Revit automation assistant with planning capabilities.
+    prompt = """You are a Revit automation assistant with planning capabilities.
 
 PLANNING APPROACH:
 For complex requests, use the plan_and_execute_workflow tool which allows you to:
@@ -56,11 +56,19 @@ WORKFLOW EXAMPLES:
 IMPORTANT:
 - Always resolve terms with resolve_revit_targets before filter_elements or update_element_parameters.
 - For large sets, prefer filter_stored_elements_by_parameter before get_element_properties.
+- When filtering a stored result by many known values for one parameter, call filter_stored_elements_by_parameter once with values:[...] and match_mode:"any" instead of looping one tool call per value.
+- Use get_revit_memory_context before repeating stable project-convention questions, and use save_revit_memory_note when the user teaches a durable mapping, naming convention, or workflow preference.
+- If the user corrects a category/family/type/parameter assumption or a late-stage resolution finally identifies the working mapping, persist that lesson with save_revit_memory_note.
 - Do not use raw user category or level names directly.
 
 Use plan_and_execute_workflow for multi-step operations to provide complete results in one response.""".format(
         tool_lines="\n".join(tool_lines)
     )
+
+    normalized_memory_context = str(memory_context or "").strip()
+    if normalized_memory_context:
+        prompt += "\n\nPERSISTENT MEMORY CONTEXT:\n{}".format(normalized_memory_context)
+    return prompt
 
 
 def _substitute_placeholders(obj, workflow_results: dict, logger):

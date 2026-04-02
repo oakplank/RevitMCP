@@ -7,9 +7,11 @@ It supports two ways to use it:
 *   Web UI at `http://127.0.0.1:8000`
 *   Claude Desktop local MCP over stdio
 
+Repository layout note: this repository root is the pyRevit extension root. If you install from source manually, the checkout directory itself should be named `RevitMCP.extension`.
+
 ## Tools
 
-RevitMCP exposes 20 tools:
+RevitMCP exposes 22 tools:
 
 | Tool | Description |
 | --- | --- |
@@ -20,12 +22,14 @@ RevitMCP exposes 20 tools:
 | `list_family_types` | List loaded family types with category, family, type, and symbol IDs |
 | `get_revit_schema_context` | Load canonical Revit schema context including levels, categories, families, types, and common parameters |
 | `resolve_revit_targets` | Resolve user terms to exact Revit category, level, family, type, and parameter names |
+| `get_revit_memory_context` | Load persistent local user/project notes for recurring Revit conventions and workflow hints |
+| `save_revit_memory_note` | Save a persistent local user/project note for future chats and tool runs |
 | `get_elements_by_category` | Retrieve all elements for a category and store the result for follow-on actions |
 | `select_elements_by_id` | Select elements by explicit IDs or a stored result handle |
 | `select_stored_elements` | Select a previously stored search or filter result inside Revit |
 | `list_stored_elements` | List stored element result sets and their counts currently available on the server |
 | `filter_elements` | Find elements by category, level, and parameter-based conditions |
-| `filter_stored_elements_by_parameter` | Refine a stored result set with batched server-side parameter filtering |
+| `filter_stored_elements_by_parameter` | Refine a stored result set with batched server-side parameter filtering using one or many target values |
 | `get_element_properties` | Read parameter values for specific elements or an existing result handle |
 | `update_element_parameters` | Update one or many element parameters with typed value handling |
 | `place_view_on_sheet` | Create a new sheet, auto-number it, and place a matched view on it |
@@ -53,8 +57,8 @@ One `server.py` process runs one surface at a time.
 To switch manually:
 
 ```powershell
-python server.py --surface web
-python server.py --surface mcp
+python lib\RevitMCP_ExternalServer\server.py --surface web
+python lib\RevitMCP_ExternalServer\server.py --surface mcp
 ```
 
 If you use the pyRevit launcher, it reads the preferred surface from:
@@ -74,10 +78,19 @@ If you want both the Web UI and Claude Desktop at the same time, they need to ru
 ## Install RevitMCP
 
 1.  Install pyRevit: [pyRevit installer](https://pyrevitlabs.io/docs/pyrevit/installer)
-2.  Copy `RevitMCP.extension` into one of these folders:
+2.  Choose one of these pyRevit extension roots:
     *   `%APPDATA%\pyRevit\Extensions`
     *   `%PROGRAMDATA%\pyRevit\Extensions`
-3.  Reload pyRevit or restart Revit.
+3.  Clone this repository directly into a folder named `RevitMCP.extension` under that root:
+
+```powershell
+git clone https://github.com/oakplank/RevitMCP.git "%APPDATA%\pyRevit\Extensions\RevitMCP.extension"
+```
+
+4.  If you download a ZIP instead, extract the repository contents into a folder named `RevitMCP.extension` under the same extension root.
+5.  Reload pyRevit or restart Revit.
+
+The folder name matters: pyRevit discovers extensions by folders that end with `.extension`.
 
 ## Enable Revit Routes
 

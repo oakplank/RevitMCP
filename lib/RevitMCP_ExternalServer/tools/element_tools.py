@@ -17,6 +17,7 @@ UPDATE_ELEMENT_PARAMETERS_TOOL_NAME = "update_element_parameters"
 FILTER_STRING_OPERATORS = ["contains", "equals", "not_equals", "starts_with", "ends_with"]
 FILTER_NUMERIC_OPERATORS = ["greater_than", "greater_than_or_equal", "less_than", "less_than_or_equal"]
 FILTER_OPERATORS = FILTER_STRING_OPERATORS + FILTER_NUMERIC_OPERATORS
+FILTER_MULTI_MATCH_MODES = ["any", "all"]
 
 
 def get_active_selection_handler(services, limit: int = 200, **_kwargs) -> dict:
@@ -579,11 +580,30 @@ def _matches_filter_value(candidate_value, expected_value, operator="contains", 
     return False, "Unsupported filter operator '{}'.".format(operator)
 
 
+def _normalize_filter_values(value=None, values=None) -> list[str]:
+    normalized_values = []
+    if value is not None:
+        normalized_values.append(str(value))
+    if isinstance(values, list):
+        normalized_values.extend([str(item) for item in values if item is not None])
+
+    deduped_values = []
+    seen = set()
+    for candidate in normalized_values:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped_values.append(candidate)
+    return deduped_values
+
+
 def filter_stored_elements_by_parameter_handler(
     services,
     parameter_name: str,
-    value: str,
+    value: str = None,
+    values: list[str] = None,
     operator: str = "contains",
+    match_mode: str = "any",
     result_handle: str = None,
     category_name: str = None,
     batch_size: int = None,
@@ -591,25 +611,40 @@ def filter_stored_elements_by_parameter_handler(
     **_kwargs,
 ) -> dict:
     services.logger.info(
-        "MCP Tool executed: %s (parameter=%s, operator=%s, value=%s, result_handle=%s, category_name=%s, batch_size=%s)",
+        (
+            "MCP Tool executed: %s (parameter=%s, operator=%s, value=%s, values=%s, match_mode=%s, "
+            "result_handle=%s, category_name=%s, batch_size=%s)"
+        ),
         FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME,
         parameter_name,
         operator,
         value,
+        values,
+        match_mode,
         result_handle,
         category_name,
         batch_size,
     )
 
     normalized_operator = _normalize_filter_operator(operator)
-    if not parameter_name or value is None:
-        return {"status": "error", "message": "parameter_name and value are required."}
+    filter_values = _normalize_filter_values(value=value, values=values)
+    normalized_match_mode = str(match_mode or "any").strip().lower()
+    if not parameter_name or not filter_values:
+        return {"status": "error", "message": "parameter_name and either value or values are required."}
     if not normalized_operator:
         return {
             "status": "error",
             "message": "Unsupported filter operator '{}'. Supported operators: {}.".format(
                 operator,
                 ", ".join(FILTER_OPERATORS),
+            ),
+        }
+    if normalized_match_mode not in FILTER_MULTI_MATCH_MODES:
+        return {
+            "status": "error",
+            "message": "Unsupported match_mode '{}'. Supported values: {}.".format(
+                match_mode,
+                ", ".join(FILTER_MULTI_MATCH_MODES),
             ),
         }
     operator = normalized_operator
@@ -669,15 +704,25 @@ def filter_stored_elements_by_parameter_handler(
             typed_properties = element_data.get("typed_properties", {}) or {}
             current_value = properties.get(parameter_name, "Not available")
             typed_value = typed_properties.get(parameter_name, {})
-            matched, match_error = _matches_filter_value(
-                current_value,
-                value,
-                operator=operator,
-                case_sensitive=case_sensitive,
-                typed_value=typed_value,
-            )
-            if match_error:
-                return {"status": "error", "message": match_error, "parameter_name": parameter_name, "operator": operator}
+            match_results = []
+            for filter_value in filter_values:
+                matched, match_error = _matches_filter_value(
+                    current_value,
+                    filter_value,
+                    operator=operator,
+                    case_sensitive=case_sensitive,
+                    typed_value=typed_value,
+                )
+                if match_error:
+                    return {
+                        "status": "error",
+                        "message": match_error,
+                        "parameter_name": parameter_name,
+                        "operator": operator,
+                    }
+                match_results.append(bool(matched))
+
+            matched = any(match_results) if normalized_match_mode == "any" else all(match_results)
             if matched:
                 matched_ids.append(element_id)
                 if len(matched_samples) < services.config.max_records_in_response:
@@ -705,7 +750,9 @@ def filter_stored_elements_by_parameter_handler(
         "processed_count": total_ids,
         "parameter_name": parameter_name,
         "operator": operator,
-        "value": str(value),
+        "value": str(filter_values[0]) if len(filter_values) == 1 else None,
+        "values": filter_values,
+        "match_mode": normalized_match_mode,
         "case_sensitive": bool(case_sensitive),
         "matched_sample": matched_samples,
         "element_ids": matched_ids,
@@ -731,6 +778,8 @@ def filter_stored_elements_by_parameter_handler(
             "parameter_name",
             "operator",
             "value",
+            "values",
+            "match_mode",
         ],
     )
 
@@ -980,8 +1029,8 @@ def build_element_tools() -> list[ToolDefinition]:
             name=FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME,
             description=(
                 "Filters a previously stored element set using server-side batched parameter reads. Supports the "
-                "same string and numeric operators as filter_elements and is intended for narrowing stored results "
-                "before selection."
+                "same string and numeric operators as filter_elements, accepts one or many comparison values, and "
+                "is intended for narrowing stored results before selection."
             ),
             json_schema={
                 "type": "object",
@@ -989,7 +1038,12 @@ def build_element_tools() -> list[ToolDefinition]:
                     "result_handle": {"type": "string"},
                     "category_name": {"type": "string"},
                     "parameter_name": {"type": "string"},
-                    "value": {"type": "string"},
+                    "value": {"type": "string", "description": "Single comparison value. Use values for bulk matching."},
+                    "values": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Multiple comparison values to evaluate in one server-side pass.",
+                    },
                     "operator": {
                         "type": "string",
                         "enum": FILTER_OPERATORS,
@@ -998,10 +1052,15 @@ def build_element_tools() -> list[ToolDefinition]:
                             "greater_than_or_equal, less_than, and less_than_or_equal."
                         ),
                     },
+                    "match_mode": {
+                        "type": "string",
+                        "enum": FILTER_MULTI_MATCH_MODES,
+                        "description": "How to evaluate values when multiple comparison values are supplied.",
+                    },
                     "batch_size": {"type": "integer"},
                     "case_sensitive": {"type": "boolean"},
                 },
-                "required": ["parameter_name", "value"],
+                "required": ["parameter_name"],
             },
             handler=filter_stored_elements_by_parameter_handler,
         ),

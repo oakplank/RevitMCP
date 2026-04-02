@@ -45,6 +45,66 @@ def _best_match(term: str, candidates: list[str], fuzzy_cutoff: float = 0.5):
     return None, [], 0.0
 
 
+def _save_resolution_memory(services, mapping_kind: str, original_value: str, resolved_value: str, confidence: float) -> None:
+    if not getattr(services, "memory_store", None):
+        return
+
+    original_text = str(original_value or "").strip()
+    resolved_text = str(resolved_value or "").strip()
+    if not original_text or not resolved_text:
+        return
+    if _normalize_label(original_text) == _normalize_label(resolved_text):
+        return
+
+    mapping_kind_normalized = str(mapping_kind or "").strip().lower()
+    if mapping_kind_normalized == "parameter":
+        note_type = "parameter_mapping"
+        title = "Parameter mapping: {} -> {}".format(original_text, resolved_text)
+        content = (
+            "When the user refers to '{}', use the Revit parameter '{}' in this project. "
+            "Saved automatically after successful resolution (confidence {})."
+        ).format(original_text, resolved_text, round(float(confidence or 0.0), 3))
+    elif mapping_kind_normalized == "category":
+        note_type = "category_mapping"
+        title = "Category mapping: {} -> {}".format(original_text, resolved_text)
+        content = (
+            "When the user refers to '{}', use the Revit category '{}' in this project. "
+            "Saved automatically after successful resolution (confidence {})."
+        ).format(original_text, resolved_text, round(float(confidence or 0.0), 3))
+    elif mapping_kind_normalized in ("family", "type"):
+        note_type = "family_mapping"
+        title = "{} mapping: {} -> {}".format(mapping_kind_normalized.capitalize(), original_text, resolved_text)
+        content = (
+            "When the user refers to '{}', use the Revit {} '{}' in this project. "
+            "Saved automatically after successful resolution (confidence {})."
+        ).format(original_text, mapping_kind_normalized, resolved_text, round(float(confidence or 0.0), 3))
+    else:
+        note_type = "model_context"
+        title = "{} mapping: {} -> {}".format(mapping_kind_normalized.capitalize(), original_text, resolved_text)
+        content = (
+            "When the user refers to '{}', use the Revit {} '{}' in this project. "
+            "Saved automatically after successful resolution (confidence {})."
+        ).format(original_text, mapping_kind_normalized, resolved_text, round(float(confidence or 0.0), 3))
+
+    try:
+        services.memory_store.save_note(
+            title=title,
+            content=content,
+            note_type=note_type,
+            scope="project",
+            keywords=[mapping_kind_normalized, original_text, resolved_text],
+            project_context=services.memory_store.get_current_project_context(services),
+        )
+    except Exception as exc:
+        services.logger.warning(
+            "Failed to persist automatic resolution memory for %s '%s' -> '%s': %s",
+            mapping_kind_normalized,
+            original_text,
+            resolved_text,
+            exc,
+        )
+
+
 def get_revit_project_info_handler(services, **_kwargs) -> dict:
     services.logger.info("MCP Tool executed: %s", REVIT_INFO_TOOL_NAME)
     return services.revit_client.call_listener(command_path="/project_info", method="GET")
@@ -175,6 +235,8 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
         if resolved_category:
             resolution["resolved"]["category_name"] = resolved_category
             resolution["confidence"]["category_name"] = round(confidence, 3)
+            if confidence >= services.config.min_confidence_for_parameter_remap:
+                _save_resolution_memory(services, "category", category_term, resolved_category, confidence)
             if alternatives:
                 resolution["alternatives"]["category_name"] = alternatives
         else:
@@ -186,6 +248,8 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
         if resolved_level:
             resolution["resolved"]["level_name"] = resolved_level
             resolution["confidence"]["level_name"] = round(confidence, 3)
+            if confidence >= services.config.min_confidence_for_parameter_remap:
+                _save_resolution_memory(services, "level", level_term, resolved_level, confidence)
             if alternatives:
                 resolution["alternatives"]["level_name"] = alternatives
         else:
@@ -197,6 +261,8 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
         if resolved_family:
             resolution["resolved"]["family_name"] = resolved_family
             resolution["confidence"]["family_name"] = round(confidence, 3)
+            if confidence >= services.config.min_confidence_for_parameter_remap:
+                _save_resolution_memory(services, "family", family_term, resolved_family, confidence)
             if alternatives:
                 resolution["alternatives"]["family_name"] = alternatives
         else:
@@ -208,6 +274,8 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
         if resolved_type:
             resolution["resolved"]["type_name"] = resolved_type
             resolution["confidence"]["type_name"] = round(confidence, 3)
+            if confidence >= services.config.min_confidence_for_parameter_remap:
+                _save_resolution_memory(services, "type", type_term, resolved_type, confidence)
             if alternatives:
                 resolution["alternatives"]["type_name"] = alternatives
         else:
@@ -228,6 +296,7 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
                     "resolved_name": resolved_param,
                     "confidence": round(confidence, 3),
                 }
+                _save_resolution_memory(services, "parameter", parameter_name, resolved_param, confidence)
                 if alternatives:
                     unresolved_params[parameter_name] = alternatives
             else:

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from .memory_store import MemoryStore
 from .result_store import ResultStore
 from .revit_client import RevitClient
 from .runtime_config import RuntimeConfig
@@ -12,12 +13,14 @@ class ServerServices:
     logger: object
     result_store: ResultStore
     revit_client: RevitClient
+    memory_store: MemoryStore = None
     app: object = None
     tool_registry: object = None
 
 
 def create_services(config: RuntimeConfig, startup_logger, app) -> ServerServices:
     result_store = ResultStore(config=config, logger=app.logger)
+    memory_store = MemoryStore(logger=app.logger)
     revit_client = RevitClient(
         config=config,
         logger=app.logger,
@@ -30,5 +33,6 @@ def create_services(config: RuntimeConfig, startup_logger, app) -> ServerService
         logger=app.logger,
         result_store=result_store,
         revit_client=revit_client,
+        memory_store=memory_store,
         app=app,
     )

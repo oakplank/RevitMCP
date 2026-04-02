@@ -28,15 +28,26 @@ def run_chat_request(
 ):
     data = request_data or {}
     conversation_history = data.get("conversation") or []
+    last_user_message = conversation_history[-1]["content"] if conversation_history else ""
     api_key = data.get("apiKey")
     selected_model_ui_name = data.get("model") or ""
     selected_provider = data.get("provider") or _infer_provider_from_model_name(selected_model_ui_name)
-    planning_system_prompt = build_planning_system_prompt(tool_registry)
+    project_context = services.memory_store.get_current_project_context(services) if getattr(services, "memory_store", None) else {}
+    memory_context = (
+        services.memory_store.build_prompt_context(
+            query_text=last_user_message,
+            scope="auto",
+            project_context=project_context,
+            max_notes=6,
+        )
+        if getattr(services, "memory_store", None)
+        else ""
+    )
+    planning_system_prompt = build_planning_system_prompt(tool_registry, memory_context=memory_context)
 
     execute_tool_call = lambda tool_name, function_args: tool_registry.dispatch(services, tool_name, function_args)
 
     if selected_provider == "echo" or selected_model_ui_name == "echo_model":
-        last_user_message = conversation_history[-1]["content"] if conversation_history else ""
         provider_result = ProviderResult(reply=f"Echo: {last_user_message}")
     elif selected_provider == "openai":
         provider_result = run_openai_chat(

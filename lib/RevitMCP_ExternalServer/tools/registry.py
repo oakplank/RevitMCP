@@ -146,11 +146,13 @@ class ToolRegistry:
 def build_tool_registry() -> ToolRegistry:
     from .context_tools import build_context_tools
     from .element_tools import build_element_tools
+    from .memory_tools import build_memory_tools
     from .view_tools import build_view_tools
     from .planning_tools import build_planning_tools
 
     definitions = []
     definitions.extend(build_context_tools())
+    definitions.extend(build_memory_tools())
     definitions.extend(build_view_tools())
     definitions.extend(build_element_tools())
     definitions.extend(build_planning_tools())

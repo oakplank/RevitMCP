@@ -2,6 +2,7 @@ import importlib
 import os
 import sys
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,11 +12,20 @@ if str(LIB_ROOT) not in sys.path:
     sys.path.insert(0, str(LIB_ROOT))
 
 
+def make_workspace_temp_file_path(prefix: str) -> str:
+    base_dir = LIB_ROOT / "_tmp_testdata"
+    base_dir.mkdir(exist_ok=True)
+    return str(base_dir / "{}_{}.json".format(prefix, uuid.uuid4().hex))
+
+
 from RevitMCP_ExternalServer.bootstrap import create_application
+from RevitMCP_ExternalServer.core.memory_store import MemoryStore
 from RevitMCP_ExternalServer.core.runtime_config import resolve_runtime_surface
 from RevitMCP_ExternalServer.providers.anthropic_provider import run_anthropic_chat
 from RevitMCP_ExternalServer.providers.google_provider import run_google_chat
 from RevitMCP_ExternalServer.providers.openai_provider import run_openai_chat
+from RevitMCP_ExternalServer.tools.context_tools import resolve_revit_targets_internal
+from RevitMCP_ExternalServer.tools.element_tools import filter_stored_elements_by_parameter_handler
 from RevitMCP_ExternalServer.tools.registry import build_tool_registry
 from RevitMCP_ExternalServer.web.chat_service import run_chat_request
 
@@ -61,13 +71,19 @@ class RegistryTests(unittest.TestCase):
 
         definition_map = {definition.name: definition for definition in definitions}
         filter_parameters = definition_map["filter_elements"].json_schema["properties"]["parameters"]["items"]["properties"]
+        stored_filter_schema = definition_map["filter_stored_elements_by_parameter"].json_schema
         filter_operator_enum = filter_parameters["operator"]["enum"]
-        stored_operator_enum = definition_map["filter_stored_elements_by_parameter"].json_schema["properties"]["operator"]["enum"]
+        stored_operator_enum = stored_filter_schema["properties"]["operator"]["enum"]
 
         self.assertIn("greater_than", filter_operator_enum)
         self.assertIn("greater_than_or_equal", filter_operator_enum)
         self.assertIn("less_than_or_equal", filter_operator_enum)
         self.assertEqual(filter_operator_enum, stored_operator_enum)
+        self.assertIn("values", stored_filter_schema["properties"])
+        self.assertIn("match_mode", stored_filter_schema["properties"])
+        self.assertEqual(stored_filter_schema["required"], ["parameter_name"])
+        self.assertIn("get_revit_memory_context", definition_map)
+        self.assertIn("save_revit_memory_note", definition_map)
 
     def test_dispatch_known_and_unknown_tool(self):
         app, _mcp_server, services, registry = create_application(
@@ -287,6 +303,230 @@ class ChatServiceTests(unittest.TestCase):
         self.assertIsNotNone(app)
         self.assertEqual(status_code, 500)
         self.assertIn("provider 'not-real'", response_payload["error"])
+
+
+class ElementToolTests(unittest.TestCase):
+    def test_filter_stored_elements_supports_multi_value_any_match(self):
+        property_reads = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                property_reads.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "elements": [
+                        {
+                            "element_id": "101",
+                            "properties": {"Mark": "A-01"},
+                            "typed_properties": {"Mark": {"storage_type": "String", "is_numeric": False}},
+                        },
+                        {
+                            "element_id": "102",
+                            "properties": {"Mark": "B-02"},
+                            "typed_properties": {"Mark": {"storage_type": "String", "is_numeric": False}},
+                        },
+                        {
+                            "element_id": "103",
+                            "properties": {"Mark": "C-03"},
+                            "typed_properties": {"Mark": {"storage_type": "String", "is_numeric": False}},
+                        },
+                    ],
+                }
+
+            def is_route_not_defined(self, *_args, **_kwargs):
+                return False
+
+        class FakeResultStore:
+            def resolve_element_ids(self, **_kwargs):
+                return ["101", "102", "103"], {"storage_key": "curtain_panels"}, None
+
+            def normalize_storage_key(self, value):
+                return str(value or "").lower().replace(" ", "_")
+
+            def store_elements(self, category_name, element_ids, count):
+                self.stored = (category_name, element_ids, count)
+                return category_name, "res_filtered"
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(
+                min_confidence_for_parameter_remap=0.82,
+                default_server_filter_batch_size=600,
+                max_records_in_response=20,
+            ),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        with patch(
+            "RevitMCP_ExternalServer.tools.element_tools.resolve_revit_targets_internal",
+            return_value={"status": "success", "resolved": {"parameter_names": {}}},
+        ):
+            result = filter_stored_elements_by_parameter_handler(
+                services,
+                parameter_name="Mark",
+                values=["A-01", "C-03"],
+                operator="equals",
+                match_mode="any",
+                result_handle="res_source",
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["values"], ["A-01", "C-03"])
+        self.assertEqual(result["match_mode"], "any")
+        self.assertEqual(result["element_ids"], ["101", "103"])
+        self.assertEqual(len(property_reads), 1)
+        self.assertEqual(property_reads[0][0], "/elements/get_properties")
+
+
+class ContextToolMemoryTests(unittest.TestCase):
+    def test_resolve_revit_targets_auto_saves_non_exact_resolution_mappings(self):
+        saved_notes = []
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(min_confidence_for_parameter_remap=0.82),
+            result_store=SimpleNamespace(compact_result_payload=lambda result: result),
+            memory_store=SimpleNamespace(
+                save_note=lambda **kwargs: saved_notes.append(kwargs),
+                get_current_project_context=lambda _services: {"project_key": "proj-1", "project_name": "Tower A"},
+            ),
+        )
+
+        with patch(
+            "RevitMCP_ExternalServer.tools.context_tools.get_revit_schema_context_handler",
+            return_value={
+                "status": "success",
+                "schema": {
+                    "built_in_categories": [],
+                    "document_categories": ["Curtain Panels"],
+                    "levels": [],
+                    "family_names": [],
+                    "type_names": [],
+                    "parameter_names": ["Reference Level"],
+                },
+                "doc": {},
+            },
+        ):
+            result = resolve_revit_targets_internal(
+                services,
+                {"category_name": "Panels", "parameter_names": ["reference"]},
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["resolved"]["category_name"], "Curtain Panels")
+        self.assertEqual(result["resolved"]["parameter_names"]["reference"]["resolved_name"], "Reference Level")
+        self.assertEqual(len(saved_notes), 2)
+        self.assertEqual(saved_notes[0]["note_type"], "category_mapping")
+        self.assertEqual(saved_notes[1]["note_type"], "parameter_mapping")
+        self.assertIn("Panels", saved_notes[0]["title"])
+        self.assertIn("Reference Level", saved_notes[1]["content"])
+
+
+class MemoryStoreTests(unittest.TestCase):
+    def test_memory_store_prefers_project_notes_for_relevant_query(self):
+        memory_path = make_workspace_temp_file_path("memory_store")
+        try:
+            store = MemoryStore(
+                logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None),
+                storage_path=memory_path,
+            )
+            project_context = {"project_key": "proj-1", "project_name": "Tower A", "project_number": "001"}
+
+            store.save_note(
+                title="Curtain panels carry frame sequences",
+                content="Frame sequence values in this model are stored on Curtain Panels under Mark.",
+                note_type="category_mapping",
+                scope="project",
+                keywords=["curtain panels", "mark", "frame sequence"],
+                project_context=project_context,
+            )
+            store.save_note(
+                title="Fallback category check",
+                content="If panels do not match, inspect Generic Models next.",
+                note_type="workflow_hint",
+                scope="global",
+                keywords=["generic models"],
+                project_context={},
+            )
+
+            notes = store.list_notes(
+                query_text="find frame sequence marks on curtain panels",
+                scope="auto",
+                project_context=project_context,
+                max_notes=5,
+            )
+            prompt_context = store.build_prompt_context(
+                query_text="find frame sequence marks on curtain panels",
+                scope="auto",
+                project_context=project_context,
+                max_notes=5,
+            )
+        finally:
+            if os.path.exists(memory_path):
+                os.remove(memory_path)
+
+        self.assertGreaterEqual(len(notes), 2)
+        self.assertEqual(notes[0]["title"], "Curtain panels carry frame sequences")
+        self.assertIn("Relevant persistent Revit memory", prompt_context)
+        self.assertIn("Curtain panels carry frame sequences", prompt_context)
+        self.assertIn("Tower A", prompt_context)
+
+
+class ChatServiceMemoryTests(unittest.TestCase):
+    def test_run_chat_request_includes_memory_context_in_system_prompt(self):
+        _app, _mcp_server, services, registry = create_application(
+            launch_background_tasks=False,
+            detect_revit_on_startup=False,
+        )
+
+        memory_path = make_workspace_temp_file_path("chat_memory")
+        try:
+            services.memory_store.storage_path = memory_path
+            services.memory_store.save_note(
+                title="Curtain panel mark mapping",
+                content="Sequence identifiers for this workflow are usually stored on Curtain Panels in the Mark parameter.",
+                note_type="workflow_hint",
+                scope="global",
+                keywords=["curtain panels", "mark"],
+                project_context={},
+            )
+            services.memory_store.get_current_project_context = lambda _services: {}
+
+            captured = {}
+
+            class FakeOpenAIClient:
+                def __init__(self, **_kwargs):
+                    self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+                def create(self, **kwargs):
+                    captured["system_prompt"] = kwargs["messages"][0]["content"]
+                    message = SimpleNamespace(content="memory ok", tool_calls=[])
+                    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+            response_payload, status_code = run_chat_request(
+                services,
+                registry,
+                {
+                    "conversation": [{"role": "user", "content": "find those frame sequence marks"}],
+                    "model": "gpt-test",
+                    "provider": "openai",
+                    "apiKey": "key",
+                },
+                openai_client_factory=FakeOpenAIClient,
+            )
+        finally:
+            if os.path.exists(memory_path):
+                os.remove(memory_path)
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(response_payload["reply"], "memory ok")
+        self.assertIn("Relevant persistent Revit memory", captured["system_prompt"])
+        self.assertIn("Curtain panel mark mapping", captured["system_prompt"])
 
 
 class CompatibilityTests(unittest.TestCase):
