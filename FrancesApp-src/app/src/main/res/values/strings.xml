@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Aprenda Francês</string>
+    <string name="lesson_title">Lição</string>
+    <string name="quiz_title">Quiz de Francês</string>
+</resources>

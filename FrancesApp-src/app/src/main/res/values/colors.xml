@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- French flag blue -->
+    <color name="colorPrimary">#002395</color>
+    <color name="colorPrimaryDark">#001A6E</color>
+    <color name="colorPrimaryLight">#3356CC</color>
+
+    <!-- French flag red -->
+    <color name="colorSecondary">#ED2939</color>
+    <color name="colorSecondaryDark">#C01D2B</color>
+
+    <!-- Background -->
+    <color name="colorBackground">#F0F2FF</color>
+
+    <!-- Text -->
+    <color name="colorTextPrimary">#1A1A2E</color>
+    <color name="colorTextSecondary">#6B7280</color>
+
+    <!-- Quiz states -->
+    <color name="colorCorrect">#16A34A</color>
+    <color name="colorWrong">#DC2626</color>
+    <color name="colorOptionNormal">#FFFFFF</color>
+</resources>
