@@ -6,12 +6,12 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
 import android.widget.TextView;
 import java.util.Collections;
 import java.util.List;
@@ -36,7 +36,8 @@ public class QuizActivity extends Activity {
     private boolean answered = false;
 
     private TextView tvProgress, tvQuestion, tvScoreRunning;
-    private ProgressBar progressBar;
+    private View progressBarFill;
+    private LinearLayout progressBarContainer;
     private Button[] optionButtons;
     private LinearLayout layoutQuiz, layoutResult;
     private TextView tvResultEmoji, tvResultTitle, tvResultScore, tvResultMessage;
@@ -116,15 +117,19 @@ public class QuizActivity extends Activity {
 
         layoutQuiz.addView(progressRow);
 
-        // Progress bar
-        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        progressBar.setProgressDrawable(null);
-        progressBar.getIndeterminateDrawable();
+        // Progress bar (custom view — evita NPE do ProgressBar nativo)
+        progressBarContainer = new LinearLayout(this);
+        progressBarContainer.setBackgroundColor(Color.parseColor("#E0E0E0"));
         LinearLayout.LayoutParams pbp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(8));
         pbp.bottomMargin = dp(20);
-        progressBar.setLayoutParams(pbp);
-        layoutQuiz.addView(progressBar);
+        progressBarContainer.setLayoutParams(pbp);
+
+        progressBarFill = new View(this);
+        progressBarFill.setBackgroundColor(Color.parseColor("#ED2939"));
+        progressBarFill.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT));
+        progressBarContainer.addView(progressBarFill);
+        layoutQuiz.addView(progressBarContainer);
 
         // Question card
         LinearLayout questionCard = new LinearLayout(this);
@@ -264,8 +269,11 @@ public class QuizActivity extends Activity {
         int total = questions.size();
 
         tvProgress.setText("Pergunta " + (currentIndex + 1) + " de " + total);
-        progressBar.setMax(total);
-        progressBar.setProgress(currentIndex);
+        // Atualiza barra de progresso customizada
+        int containerWidth = progressBarContainer.getWidth();
+        int fillWidth = (containerWidth > 0 && total > 0) ? (containerWidth * currentIndex / total) : 0;
+        LinearLayout.LayoutParams fillParams = new LinearLayout.LayoutParams(fillWidth, ViewGroup.LayoutParams.MATCH_PARENT);
+        progressBarFill.setLayoutParams(fillParams);
         tvQuestion.setText(q.text);
         tvScoreRunning.setText("Pontos: " + score);
 
@@ -296,7 +304,7 @@ public class QuizActivity extends Activity {
 
         for (Button btn : optionButtons) btn.setEnabled(false);
 
-        new Handler().postDelayed(() -> {
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
             currentIndex++;
             showQuestion();
         }, 1200);

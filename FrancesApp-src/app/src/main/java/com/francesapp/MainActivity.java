@@ -19,7 +19,21 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        try {
+            buildUI();
+        } catch (Throwable t) {
+            // Mostra o erro real na tela para diagnóstico
+            TextView err = new TextView(this);
+            err.setText("ERRO: " + t.getClass().getSimpleName() + "\n\n" + t.getMessage() + "\n\nStack:\n" + android.util.Log.getStackTraceString(t));
+            err.setTextSize(11f);
+            err.setPadding(16, 32, 16, 16);
+            err.setBackgroundColor(Color.WHITE);
+            err.setTextColor(Color.RED);
+            setContentView(err);
+        }
+    }
 
+    private void buildUI() {
         List<LessonData.Lesson> lessons = LessonData.getLessons();
 
         LinearLayout root = new LinearLayout(this);
