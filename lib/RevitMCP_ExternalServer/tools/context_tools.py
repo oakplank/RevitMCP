@@ -15,6 +15,31 @@ def _normalize_label(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+def _rank_by_similarity(term: str, candidates: list[str], limit: int = 10) -> list[str]:
+    """Return up to `limit` candidates ranked by string similarity to `term`.
+
+    Used as the fallback for `alternatives` when no candidate clears the
+    confidence threshold — beats dumping the alphabetical first-N, which
+    is rarely what the caller wants to see.
+    """
+    if not term or not candidates:
+        return []
+    term_lower = str(term).lower()
+    normalized_term = _normalize_label(term)
+    scored = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        score = difflib.SequenceMatcher(None, term_lower, str(candidate).lower()).ratio()
+        if normalized_term and normalized_term in _normalize_label(candidate):
+            score += 0.15
+        scored.append((score, candidate))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [candidate for _, candidate in scored[:limit]]
+
+
 def _best_match(term: str, candidates: list[str], fuzzy_cutoff: float = 0.5):
     if not term or not candidates:
         return None, [], 0.0
@@ -192,10 +217,20 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
     parameter_names = schema.get("parameter_names", []) or []
 
     query_terms = query_terms or {}
-    category_term = query_terms.get("category_name")
-    level_term = query_terms.get("level_name")
-    family_term = query_terms.get("family_name")
-    type_term = query_terms.get("type_name")
+
+    def _first(*keys):
+        for key in keys:
+            value = query_terms.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+            if value not in (None, "", [], {}):
+                return value
+        return None
+
+    category_term = _first("category_name", "category", "categories")
+    level_term = _first("level_name", "level", "levels")
+    family_term = _first("family_name", "family", "families")
+    type_term = _first("type_name", "type", "types")
     parameter_terms = query_terms.get("parameter_names", []) or []
 
     if isinstance(parameter_terms, str):
@@ -221,6 +256,23 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
         normalized_parameter_terms.append(parameter_term_str)
     parameter_terms = normalized_parameter_terms
 
+    if not any([category_term, level_term, family_term, type_term, parameter_terms]):
+        return {
+            "status": "error",
+            "message": (
+                "No recognized query terms supplied. Use one or more of: "
+                "category_name, level_name, family_name, type_name, parameter_names."
+            ),
+            "received_keys": sorted(query_terms.keys()),
+            "expected_keys": [
+                "category_name",
+                "level_name",
+                "family_name",
+                "type_name",
+                "parameter_names",
+            ],
+        }
+
     resolution = {
         "status": "success",
         "resolved": {},
@@ -241,7 +293,7 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
                 resolution["alternatives"]["category_name"] = alternatives
         else:
             resolution["status"] = "partial"
-            resolution["alternatives"]["category_name"] = category_candidates[:25]
+            resolution["alternatives"]["category_name"] = _rank_by_similarity(category_term, category_candidates)
 
     if level_term:
         resolved_level, alternatives, confidence = _best_match(level_term, levels)
@@ -254,7 +306,7 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
                 resolution["alternatives"]["level_name"] = alternatives
         else:
             resolution["status"] = "partial"
-            resolution["alternatives"]["level_name"] = levels[:25]
+            resolution["alternatives"]["level_name"] = _rank_by_similarity(level_term, levels)
 
     if family_term:
         resolved_family, alternatives, confidence = _best_match(family_term, family_names)
@@ -267,7 +319,7 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
                 resolution["alternatives"]["family_name"] = alternatives
         else:
             resolution["status"] = "partial"
-            resolution["alternatives"]["family_name"] = family_names[:25]
+            resolution["alternatives"]["family_name"] = _rank_by_similarity(family_term, family_names)
 
     if type_term:
         resolved_type, alternatives, confidence = _best_match(type_term, type_names)
@@ -280,7 +332,7 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
                 resolution["alternatives"]["type_name"] = alternatives
         else:
             resolution["status"] = "partial"
-            resolution["alternatives"]["type_name"] = type_names[:25]
+            resolution["alternatives"]["type_name"] = _rank_by_similarity(type_term, type_names)
 
     if parameter_terms:
         resolved_params = {}
@@ -301,7 +353,7 @@ def resolve_revit_targets_internal(services, query_terms: dict = None) -> dict:
                     unresolved_params[parameter_name] = alternatives
             else:
                 resolution["status"] = "partial"
-                unresolved_params[parameter_name] = parameter_names[:25]
+                unresolved_params[parameter_name] = _rank_by_similarity(parameter_name, parameter_names)
         resolution["resolved"]["parameter_names"] = resolved_params
         if unresolved_params:
             resolution["alternatives"]["parameter_names"] = unresolved_params
