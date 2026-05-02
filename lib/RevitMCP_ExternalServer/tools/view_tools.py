@@ -139,17 +139,50 @@ def get_active_view_elements_handler(
     )
 
 
-def place_view_on_sheet_handler(services, view_name: str, exact_match: bool = False, **_kwargs) -> dict:
+def place_view_on_sheet_handler(
+    services,
+    view_name: str = None,
+    view_id: str = None,
+    target_sheet_id: str = None,
+    target_sheet_name: str = None,
+    titleblock_id: str = None,
+    titleblock_name: str = None,
+    exact_match: bool = False,
+    **_kwargs,
+) -> dict:
     services.logger.info(
-        "MCP Tool executed: %s with view_name: %s, exact_match: %s",
+        "MCP Tool executed: %s with view_name=%s, view_id=%s, target_sheet_id=%s, target_sheet_name=%s, titleblock_id=%s, titleblock_name=%s, exact_match=%s",
         PLACE_VIEW_ON_SHEET_TOOL_NAME,
         view_name,
+        view_id,
+        target_sheet_id,
+        target_sheet_name,
+        titleblock_id,
+        titleblock_name,
         exact_match,
     )
+    if not view_name and not view_id:
+        return {
+            "status": "error",
+            "message": "Provide either view_name or view_id (use view_id when multiple views share a name).",
+        }
+    payload = {"exact_match": exact_match}
+    if view_name:
+        payload["view_name"] = view_name
+    if view_id:
+        payload["view_id"] = str(view_id)
+    if target_sheet_id:
+        payload["target_sheet_id"] = str(target_sheet_id)
+    if target_sheet_name:
+        payload["target_sheet_name"] = target_sheet_name
+    if titleblock_id:
+        payload["titleblock_id"] = str(titleblock_id)
+    if titleblock_name:
+        payload["titleblock_name"] = titleblock_name
     return services.revit_client.call_listener(
         command_path="/sheets/place_view",
         method="POST",
-        payload_data={"view_name": view_name, "exact_match": exact_match},
+        payload_data=payload,
     )
 
 
@@ -441,17 +474,64 @@ def build_view_tools() -> list[ToolDefinition]:
         ToolDefinition(
             name=PLACE_VIEW_ON_SHEET_TOOL_NAME,
             description=(
-                "Places a view onto a new sheet by view name. Creates a new sheet with automatic numbering based on "
-                "view type and places the view in the center of the sheet. Supports fuzzy matching for view names "
-                "when exact_match=False."
+                "Places a view on a sheet. Two modes: (1) creates a NEW sheet (default — pass titleblock_id or "
+                "titleblock_name to control which titleblock is used; discover titleblocks via list_family_types("
+                "category_names=['Title Blocks'])); (2) places onto an EXISTING sheet (pass target_sheet_id or "
+                "target_sheet_name; titleblock_* is ignored). Identify the view by view_id (preferred when "
+                "multiple views share a name, common with Area Plans and dependent views) or view_name (with "
+                "optional fuzzy matching). To batch-sheet many views, the caller should loop this tool, picking "
+                "the titleblock once via list_family_types and reusing the symbol_id across calls."
             ),
             json_schema={
                 "type": "object",
                 "properties": {
-                    "view_name": {"type": "string", "description": "Name of the view to place on the sheet."},
-                    "exact_match": {"type": "boolean", "description": "Whether to require exact view name match."},
+                    "view_name": {
+                        "type": "string",
+                        "description": "Name of the view to place. Ignored if view_id is supplied.",
+                    },
+                    "view_id": {
+                        "type": "string",
+                        "description": (
+                            "Element ID of the view to place. Takes precedence over view_name. "
+                            "Use this to disambiguate when multiple views share a name."
+                        ),
+                    },
+                    "target_sheet_id": {
+                        "type": "string",
+                        "description": (
+                            "Element ID of an existing sheet to place onto. When provided, no new sheet is "
+                            "created. Takes precedence over target_sheet_name."
+                        ),
+                    },
+                    "target_sheet_name": {
+                        "type": "string",
+                        "description": (
+                            "Name or sheet number of an existing sheet to place onto. When provided, no new "
+                            "sheet is created. Use target_sheet_id when multiple sheets share a name."
+                        ),
+                    },
+                    "titleblock_id": {
+                        "type": "string",
+                        "description": (
+                            "Element ID (symbol_id) of a titleblock FamilySymbol to use when creating a new "
+                            "sheet. Discover available titleblocks via "
+                            "list_family_types(category_names=['Title Blocks']). Takes precedence over "
+                            "titleblock_name. Ignored if target_sheet_* is supplied."
+                        ),
+                    },
+                    "titleblock_name": {
+                        "type": "string",
+                        "description": (
+                            "Family or type name of a titleblock to use when creating a new sheet. Use "
+                            "titleblock_id to disambiguate when multiple titleblocks share a name. Ignored "
+                            "if target_sheet_* is supplied."
+                        ),
+                    },
+                    "exact_match": {
+                        "type": "boolean",
+                        "description": "Whether to require exact match for view_name, target_sheet_name, and titleblock_name.",
+                    },
                 },
-                "required": ["view_name"],
             },
             handler=place_view_on_sheet_handler,
         ),

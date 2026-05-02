@@ -219,18 +219,20 @@ def get_sheet_center_point(sheet, logger):
         XYZ: Center point coordinates
     """
     try:
-        # Get the sheet's outline
+        # ViewSheet.Outline is a BoundingBoxUV (sheet space is 2-D), so its
+        # Min/Max are UV objects exposing .U/.V — not XYZ with .X/.Y. The
+        # final viewport placement still wants an XYZ, so we map U->X, V->Y
+        # and pin Z to zero.
         outline = sheet.Outline
         if outline:
             min_point = outline.Min
             max_point = outline.Max
-            
-            # Calculate center
-            center_x = (min_point.X + max_point.X) / 2.0
-            center_y = (min_point.Y + max_point.Y) / 2.0
-            center_point = XYZ(center_x, center_y, 0.0)
-            
-            logger.debug("SheetPlacementTool: Sheet center point: ({}, {})".format(center_x, center_y))
+
+            center_u = (min_point.U + max_point.U) / 2.0
+            center_v = (min_point.V + max_point.V) / 2.0
+            center_point = XYZ(center_u, center_v, 0.0)
+
+            logger.debug("SheetPlacementTool: Sheet center point: ({}, {})".format(center_u, center_v))
             return center_point
         else:
             # Fallback to a typical sheet center
@@ -259,25 +261,44 @@ def place_view_on_sheet(doc, view, sheet, location_point, logger):
         Viewport: Created viewport or None if failed
     """
     try:
-        # Check if view can be placed on a sheet
-        if not view.CanBePrinted:
-            logger.warning("SheetPlacementTool: View '{}' cannot be printed, may not be suitable for sheets".format(view.Name))
-        
-        # Check if view is already on a sheet
-        if hasattr(view, 'Sheet') and view.Sheet and view.Sheet.Id != ElementId.InvalidElementId:
-            logger.warning("SheetPlacementTool: View '{}' is already placed on sheet '{}'".format(view.Name, view.Sheet.Name))
+        # Pre-check that Revit will allow this placement. Catches dependent
+        # views, already-placed views, view types that can't be sheeted
+        # (legends with restrictions, schedules in some cases, etc.) before
+        # we hit Viewport.Create with a generic exception.
+        try:
+            can_add = Viewport.CanAddViewToSheet(doc, sheet.Id, view.Id)
+        except Exception:
+            can_add = True  # If the API call itself fails, fall through and let Create's exception speak
+
+        if not can_add:
+            already_on_sheet_name = None
+            try:
+                if hasattr(view, 'Sheet') and view.Sheet and view.Sheet.Id != ElementId.InvalidElementId:
+                    already_on_sheet_name = view.Sheet.Name
+            except Exception:
+                already_on_sheet_name = None
+
+            reason = (
+                "already placed on sheet '{}'".format(already_on_sheet_name)
+                if already_on_sheet_name
+                else "Revit refused the placement (view type may not be eligible for this sheet)"
+            )
+            logger.warning(
+                "SheetPlacementTool: Cannot place view '{}' on sheet '{}': {}".format(
+                    view.Name, sheet.Name, reason,
+                )
+            )
             return None
-        
-        # Create the viewport
+
         viewport = Viewport.Create(doc, sheet.Id, view.Id, location_point)
-        
+
         if viewport:
-            logger.info("SheetPlacementTool: Successfully placed view '{}' on sheet '{}'".format(view.Name, sheet.Name))
+            logger.info("SheetPlacementTool: Placed view '{}' on sheet '{}'".format(view.Name, sheet.Name))
             return viewport
         else:
-            logger.error("SheetPlacementTool: Failed to create viewport")
+            logger.warning("SheetPlacementTool: Viewport.Create returned None for view '{}'".format(view.Name))
             return None
-            
+
     except Exception as e:
         logger.error("SheetPlacementTool: Error placing view on sheet: {}".format(e), exc_info=True)
         return None
@@ -324,121 +345,391 @@ def get_view_type_name(view, logger):
         return "Unknown"
 
 
-def place_view_on_new_sheet(doc, view_name, logger, exact_match=False):
+def _find_target_sheet(doc, sheet_id=None, sheet_name=None, exact_match=False, logger=None):
+    """Look up an existing ViewSheet by id or name.
+
+    Returns (sheet, error_dict). If both are None, the caller should create a new sheet.
     """
-    Main function to find a view by name and place it on a new sheet.
-    
+    if sheet_id not in (None, "", 0, "0"):
+        try:
+            sheet_id_int = int(str(sheet_id).strip())
+        except Exception:
+            return None, {
+                "status": "error",
+                "message": "target_sheet_id must be an integer element id, got '{}'".format(sheet_id),
+            }
+        element = doc.GetElement(ElementId(sheet_id_int))
+        if not element:
+            return None, {
+                "status": "error",
+                "message": "No element with id {}.".format(sheet_id_int),
+                "target_sheet_id": str(sheet_id_int),
+            }
+        if not isinstance(element, ViewSheet):
+            return None, {
+                "status": "error",
+                "message": "Element {} is not a ViewSheet.".format(sheet_id_int),
+                "target_sheet_id": str(sheet_id_int),
+            }
+        return element, None
+
+    if sheet_name:
+        sheets = list(FilteredElementCollector(doc).OfClass(ViewSheet).ToElements())
+        sheet_name_str = str(sheet_name).strip()
+        if exact_match:
+            matches = [s for s in sheets if s.Name == sheet_name_str or s.SheetNumber == sheet_name_str]
+        else:
+            needle = sheet_name_str.lower()
+            matches = [
+                s for s in sheets
+                if needle in s.Name.lower() or needle in s.SheetNumber.lower()
+            ]
+        if not matches:
+            return None, {
+                "status": "error",
+                "message": "No sheets found matching '{}' (searched name and sheet number).".format(sheet_name_str),
+                "target_sheet_name": sheet_name_str,
+            }
+        if len(matches) > 1:
+            return None, {
+                "status": "multiple_matches",
+                "message": "Multiple sheets matched '{}'. Disambiguate by retrying with target_sheet_id.".format(sheet_name_str),
+                "target_sheet_name": sheet_name_str,
+                "matching_sheets": [
+                    {"name": s.Name, "number": s.SheetNumber, "id": str(s.Id.IntegerValue)}
+                    for s in matches
+                ],
+            }
+        return matches[0], None
+
+    return None, None
+
+
+def _is_titleblock_symbol(symbol):
+    try:
+        category = getattr(symbol, "Category", None)
+        if not category or not getattr(category, "Id", None):
+            return False
+        return category.Id.IntegerValue == int(BuiltInCategory.OST_TitleBlocks)
+    except Exception:
+        return False
+
+
+def _titleblock_label(symbol):
+    family_name = ""
+    try:
+        family = getattr(symbol, "Family", None)
+        family_name = family.Name if family and getattr(family, "Name", None) else ""
+    except Exception:
+        family_name = ""
+    type_name = getattr(symbol, "Name", "") or ""
+    if family_name and type_name:
+        return "{} : {}".format(family_name, type_name)
+    return type_name or family_name
+
+
+def _find_titleblock(doc, titleblock_id=None, titleblock_name=None, exact_match=False, logger=None):
+    """Look up a titleblock FamilySymbol by id or name.
+
+    Returns (symbol, error_dict). If both inputs are None, the caller should
+    fall back to the first available titleblock (existing default behavior).
+    """
+    if titleblock_id not in (None, "", 0, "0"):
+        try:
+            tb_id_int = int(str(titleblock_id).strip())
+        except Exception:
+            return None, {
+                "status": "error",
+                "message": "titleblock_id must be an integer element id, got '{}'".format(titleblock_id),
+            }
+        element = doc.GetElement(ElementId(tb_id_int))
+        if not element:
+            return None, {
+                "status": "error",
+                "message": "No element with id {}.".format(tb_id_int),
+                "titleblock_id": str(tb_id_int),
+            }
+        if not isinstance(element, FamilySymbol) or not _is_titleblock_symbol(element):
+            actual_category = ""
+            try:
+                actual_category = element.Category.Name if element.Category else ""
+            except Exception:
+                actual_category = ""
+            return None, {
+                "status": "error",
+                "message": "Element {} is not a titleblock FamilySymbol (category: '{}'). Discover titleblocks via list_family_types(category_names=[\"Title Blocks\"]).".format(
+                    tb_id_int, actual_category
+                ),
+                "titleblock_id": str(tb_id_int),
+            }
+        return element, None
+
+    if titleblock_name:
+        name_str = str(titleblock_name).strip()
+        if not name_str:
+            return None, None
+
+        symbols = [
+            s for s in FilteredElementCollector(doc).OfClass(FamilySymbol).ToElements()
+            if _is_titleblock_symbol(s)
+        ]
+
+        def _match(symbol):
+            label = _titleblock_label(symbol)
+            family_name = ""
+            try:
+                family_name = symbol.Family.Name if symbol.Family else ""
+            except Exception:
+                family_name = ""
+            type_name = getattr(symbol, "Name", "") or ""
+            candidates = [label, family_name, type_name]
+            if exact_match:
+                return name_str in candidates
+            needle = name_str.lower()
+            return any(needle in (c or "").lower() for c in candidates)
+
+        matches = [s for s in symbols if _match(s)]
+        if not matches:
+            return None, {
+                "status": "error",
+                "message": "No titleblock found matching '{}'. Discover via list_family_types(category_names=[\"Title Blocks\"]).".format(name_str),
+                "titleblock_name": name_str,
+            }
+        if len(matches) > 1:
+            return None, {
+                "status": "multiple_matches",
+                "message": "Multiple titleblocks matched '{}'. Disambiguate by retrying with titleblock_id.".format(name_str),
+                "titleblock_name": name_str,
+                "matching_titleblocks": [
+                    {
+                        "id": str(s.Id.IntegerValue),
+                        "family_name": (s.Family.Name if s.Family else ""),
+                        "type_name": getattr(s, "Name", ""),
+                        "label": _titleblock_label(s),
+                    }
+                    for s in matches
+                ],
+            }
+        return matches[0], None
+
+    return None, None
+
+
+def place_view_on_new_sheet(doc, view_name, logger, exact_match=False, view_id=None,
+                             target_sheet_id=None, target_sheet_name=None,
+                             titleblock_id=None, titleblock_name=None):
+    """
+    Find a view (by name or id) and place it on a sheet.
+
+    By default a new sheet is created using the first available titleblock.
+    Use titleblock_id (or titleblock_name) to specify a different one — discover
+    available titleblocks with list_family_types(category_names=["Title Blocks"]).
+    Use target_sheet_id (or target_sheet_name) to place onto an existing sheet
+    instead of creating one (titleblock_* is then irrelevant).
+
     Args:
         doc: Revit Document
-        view_name (str): Name of the view to place
+        view_name (str): Name of the view to place. Ignored when view_id is provided.
         logger: Logger instance
-        exact_match (bool): Whether to require exact name match
-    
+        exact_match (bool): Whether to require exact name match for view_name,
+            target_sheet_name, and titleblock_name.
+        view_id (str|int|None): Element ID of the view. Takes precedence over view_name.
+        target_sheet_id (str|int|None): Element ID of an existing sheet to place onto.
+        target_sheet_name (str|None): Name (or sheet number) of an existing sheet to place onto.
+        titleblock_id (str|int|None): Element ID of a titleblock FamilySymbol to use
+            for newly-created sheets. Takes precedence over titleblock_name.
+        titleblock_name (str|None): Family or type name of a titleblock to use for
+            newly-created sheets. Ignored if target_sheet_* is supplied.
+
     Returns:
-        dict: Result dictionary with status and details
+        dict: Result dictionary with status and details. Sets sheet_was_created=true/false.
     """
     if not REVIT_API_AVAILABLE:
         return {"status": "error", "message": "Revit API not available"}
-    
+
     try:
-        # Find matching views
-        matching_views = find_views_by_name(doc, view_name, logger, exact_match)
-        
+        if view_id not in (None, "", 0, "0"):
+            try:
+                view_id_int = int(str(view_id).strip())
+            except Exception:
+                return {
+                    "status": "error",
+                    "message": "view_id must be an integer element id, got '{}'".format(view_id),
+                }
+            element = doc.GetElement(ElementId(view_id_int))
+            if not element:
+                return {
+                    "status": "error",
+                    "message": "No view found with id {}.".format(view_id_int),
+                    "view_id": str(view_id_int),
+                }
+            if not hasattr(element, "ViewType"):
+                return {
+                    "status": "error",
+                    "message": "Element {} exists but is not a view (got {}).".format(
+                        view_id_int, type(element).__name__
+                    ),
+                    "view_id": str(view_id_int),
+                }
+            matching_views = [element]
+            view_name = element.Name
+        else:
+            matching_views = find_views_by_name(doc, view_name, logger, exact_match)
+
         if not matching_views:
             return {
                 "status": "error",
                 "message": "No views found matching '{}'".format(view_name),
                 "view_name": view_name
             }
-        
-        if len(matching_views) > 1 and exact_match:
-            # Multiple exact matches shouldn't happen, but handle it
-            return {
-                "status": "error",
-                "message": "Multiple exact matches found for '{}'. This shouldn't happen.".format(view_name),
-                "view_name": view_name,
-                "matching_views": [v.Name for v in matching_views]
-            }
-        
+
         if len(matching_views) > 1:
-            # Multiple fuzzy matches - let user know
+            # Revit permits duplicate view names across types, and dependent
+            # views share their parent's name. When the caller can't be made
+            # unique by name, they should retry with view_id.
             return {
                 "status": "multiple_matches",
-                "message": "Multiple views found matching '{}'. Please be more specific.".format(view_name),
+                "message": "Multiple views found matching '{}'. Disambiguate by retrying with view_id.".format(view_name),
                 "view_name": view_name,
-                "matching_views": [{"name": v.Name, "type": get_view_type_name(v, logger), "id": str(v.Id.IntegerValue)} for v in matching_views]
+                "exact_match": bool(exact_match),
+                "matching_views": [
+                    {"name": v.Name, "type": get_view_type_name(v, logger), "id": str(v.Id.IntegerValue)}
+                    for v in matching_views
+                ],
             }
-        
+
         # Single view found - proceed with placement
         view_to_place = matching_views[0]
         view_type_name = get_view_type_name(view_to_place, logger)
-        
-        # Get available titleblocks
-        titleblocks = get_titleblock_family_symbols(doc, logger)
-        if not titleblocks:
-            return {
-                "status": "error",
-                "message": "No titleblock family symbols found. Cannot create sheet.",
-                "view_name": view_name
-            }
-        
-        # Use the first available titleblock
-        titleblock = titleblocks[0]
-        
-        # Generate sheet number and name
-        sheet_number = find_next_sheet_number(doc, view_type_name, logger)
-        sheet_name = "{} - {}".format(view_type_name, view_to_place.Name)
-        
-        # Start transaction for sheet creation and view placement
-        with Transaction(doc, "Place View on New Sheet") as t:
-            t.Start()
-            
-            try:
-                # Create the sheet
-                new_sheet = create_new_sheet(doc, sheet_number, sheet_name, titleblock, logger)
-                if not new_sheet:
-                    t.RollBack()
+
+        # If caller pointed at an existing sheet, look it up before opening a transaction.
+        existing_sheet = None
+        if target_sheet_id or target_sheet_name:
+            existing_sheet, sheet_error = _find_target_sheet(
+                doc,
+                sheet_id=target_sheet_id,
+                sheet_name=target_sheet_name,
+                exact_match=exact_match,
+                logger=logger,
+            )
+            if sheet_error:
+                return sheet_error
+
+        # Titleblock + sheet number/name only matter when creating a new sheet.
+        titleblock = None
+        sheet_number = None
+        sheet_name_for_new = None
+        if existing_sheet is None:
+            if titleblock_id or titleblock_name:
+                titleblock, titleblock_error = _find_titleblock(
+                    doc,
+                    titleblock_id=titleblock_id,
+                    titleblock_name=titleblock_name,
+                    exact_match=exact_match,
+                    logger=logger,
+                )
+                if titleblock_error:
+                    return titleblock_error
+            else:
+                titleblocks = get_titleblock_family_symbols(doc, logger)
+                if not titleblocks:
                     return {
                         "status": "error",
-                        "message": "Failed to create new sheet",
-                        "view_name": view_name
+                        "message": "No titleblock family symbols found. Cannot create sheet.",
+                        "view_name": view_name,
                     }
-                
-                # Calculate center point for viewport placement
-                center_point = get_sheet_center_point(new_sheet, logger)
-                
-                # Place the view on the sheet
-                viewport = place_view_on_sheet(doc, view_to_place, new_sheet, center_point, logger)
+                titleblock = titleblocks[0]
+            sheet_number = find_next_sheet_number(doc, view_type_name, logger)
+            sheet_name_for_new = "{} - {}".format(view_type_name, view_to_place.Name)
+        elif titleblock_id or titleblock_name:
+            logger.warning(
+                "SheetPlacementTool: titleblock_* ignored because target_sheet_* was supplied; existing sheet keeps its current titleblock."
+            )
+
+        transaction_label = "Place View on Existing Sheet" if existing_sheet else "Place View on New Sheet"
+        with Transaction(doc, transaction_label) as t:
+            t.Start()
+
+            try:
+                if existing_sheet is not None:
+                    target_sheet = existing_sheet
+                else:
+                    target_sheet = create_new_sheet(doc, sheet_number, sheet_name_for_new, titleblock, logger)
+                    if not target_sheet:
+                        t.RollBack()
+                        return {
+                            "status": "error",
+                            "message": "Failed to create new sheet",
+                            "view_name": view_name,
+                        }
+
+                center_point = get_sheet_center_point(target_sheet, logger)
+
+                viewport = place_view_on_sheet(doc, view_to_place, target_sheet, center_point, logger)
                 if not viewport:
                     t.RollBack()
+                    already_on_sheet = None
+                    try:
+                        if hasattr(view_to_place, 'Sheet') and view_to_place.Sheet and view_to_place.Sheet.Id != ElementId.InvalidElementId:
+                            already_on_sheet = {
+                                "id": str(view_to_place.Sheet.Id.IntegerValue),
+                                "name": view_to_place.Sheet.Name,
+                                "number": view_to_place.Sheet.SheetNumber,
+                            }
+                    except Exception:
+                        already_on_sheet = None
                     return {
                         "status": "error",
-                        "message": "Failed to place view '{}' on sheet".format(view_to_place.Name),
-                        "view_name": view_name
+                        "message": (
+                            "Revit refused to place view '{}' on the sheet. {}".format(
+                                view_to_place.Name,
+                                "It is already placed on sheet '{} - {}'.".format(
+                                    already_on_sheet["number"], already_on_sheet["name"]
+                                ) if already_on_sheet else
+                                "Likely cause: dependent view, ineligible view type, or already-placed view."
+                            )
+                        ),
+                        "view_name": view_to_place.Name,
+                        "view_id": str(view_to_place.Id.IntegerValue),
+                        "already_on_sheet": already_on_sheet,
                     }
-                
-                # Commit the transaction
+
                 t.Commit()
-                
-                return {
+
+                sheet_was_created = existing_sheet is None
+                result = {
                     "status": "success",
-                    "message": "Successfully placed view '{}' on new sheet '{}'".format(view_to_place.Name, sheet_number),
                     "view_name": view_to_place.Name,
                     "view_type": view_type_name,
-                    "sheet_number": sheet_number,
-                    "sheet_name": sheet_name,
-                    "sheet_id": str(new_sheet.Id.IntegerValue),
+                    "sheet_id": str(target_sheet.Id.IntegerValue),
+                    "sheet_number": target_sheet.SheetNumber,
+                    "sheet_name": target_sheet.Name,
+                    "sheet_was_created": sheet_was_created,
                     "viewport_id": str(viewport.Id.IntegerValue),
-                    "titleblock_used": titleblock.Family.Name
                 }
-                
+                if sheet_was_created:
+                    result["message"] = "Successfully placed view '{}' on new sheet '{}'".format(
+                        view_to_place.Name, target_sheet.SheetNumber
+                    )
+                    result["titleblock_used"] = {
+                        "id": str(titleblock.Id.IntegerValue),
+                        "family_name": titleblock.Family.Name if titleblock.Family else "",
+                        "type_name": getattr(titleblock, "Name", ""),
+                        "label": _titleblock_label(titleblock),
+                    }
+                else:
+                    result["message"] = "Successfully placed view '{}' on existing sheet '{} - {}'".format(
+                        view_to_place.Name, target_sheet.SheetNumber, target_sheet.Name
+                    )
+                return result
+
             except Exception as transaction_error:
                 t.RollBack()
                 logger.error("SheetPlacementTool: Transaction failed: {}".format(transaction_error), exc_info=True)
                 return {
                     "status": "error",
                     "message": "Transaction failed: {}".format(str(transaction_error)),
-                    "view_name": view_name
+                    "view_name": view_name,
                 }
         
     except Exception as e:
