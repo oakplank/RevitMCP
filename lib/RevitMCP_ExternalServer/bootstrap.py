@@ -67,6 +67,14 @@ def create_application(
     services = create_services(config=config, startup_logger=startup_logger, app=app)
     tool_registry = build_tool_registry()
     services.tool_registry = tool_registry
+    tool_names = [definition.name for definition in tool_registry.list_definitions()]
+    server_dir = os.path.dirname(os.path.abspath(__file__))
+    app.logger.info(
+        "Tool registry loaded from %s with %s tools. get_revit_diagnostics=%s",
+        server_dir,
+        len(tool_names),
+        "get_revit_diagnostics" in tool_names,
+    )
 
     if detect_revit_on_startup:
         services.revit_client.detect_port()

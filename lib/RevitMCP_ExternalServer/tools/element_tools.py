@@ -5,6 +5,7 @@ from RevitMCP_ExternalServer.tools.registry import ToolDefinition
 
 
 GET_ACTIVE_SELECTION_TOOL_NAME = "get_active_selection"
+GET_REVIT_DIAGNOSTICS_TOOL_NAME = "get_revit_diagnostics"
 GET_ELEMENTS_BY_CATEGORY_TOOL_NAME = "get_elements_by_category"
 SELECT_ELEMENTS_TOOL_NAME = "select_elements_by_id"
 SELECT_STORED_ELEMENTS_TOOL_NAME = "select_stored_elements"
@@ -18,6 +19,18 @@ FILTER_STRING_OPERATORS = ["contains", "equals", "not_equals", "starts_with", "e
 FILTER_NUMERIC_OPERATORS = ["greater_than", "greater_than_or_equal", "less_than", "less_than_or_equal"]
 FILTER_OPERATORS = FILTER_STRING_OPERATORS + FILTER_NUMERIC_OPERATORS
 FILTER_MULTI_MATCH_MODES = ["any", "all"]
+
+
+def _bounded_int(value, default_value: int, min_value: int = 0, max_value: int = None) -> int:
+    try:
+        normalized = int(value if value is not None else default_value)
+    except Exception:
+        normalized = int(default_value)
+
+    normalized = max(min_value, normalized)
+    if max_value is not None:
+        normalized = min(max_value, normalized)
+    return normalized
 
 
 def get_active_selection_handler(services, limit: int = 200, **_kwargs) -> dict:
@@ -52,6 +65,43 @@ def get_active_selection_handler(services, limit: int = 200, **_kwargs) -> dict:
             "returned_count",
             "truncated",
             "limit",
+        ],
+    )
+
+
+def get_revit_diagnostics_handler(
+    services,
+    check_write_context: bool = False,
+    selection_limit: int = 20,
+    **_kwargs,
+) -> dict:
+    safe_selection_limit = max(0, min(200, int(selection_limit if selection_limit is not None else 20)))
+    services.logger.info(
+        "MCP Tool executed: %s with check_write_context=%s selection_limit=%s",
+        GET_REVIT_DIAGNOSTICS_TOOL_NAME,
+        check_write_context,
+        safe_selection_limit,
+    )
+    result = services.revit_client.call_listener(
+        command_path="/diagnostics/revit_state",
+        method="POST",
+        payload_data={
+            "check_write_context": bool(check_write_context),
+            "selection_limit": safe_selection_limit,
+        },
+    )
+    return services.result_store.compact_result_payload(
+        result,
+        preserve_keys=[
+            "status",
+            "message",
+            "route_version",
+            "process",
+            "document_state",
+            "active_view",
+            "selection",
+            "open_documents",
+            "write_context_check",
         ],
     )
 
@@ -94,6 +144,8 @@ def select_elements_by_id_handler(
     services,
     element_ids: list[str] = None,
     result_handle: str = None,
+    focus: bool = True,
+    refresh_view: bool = True,
     **_kwargs,
 ) -> dict:
     services.logger.info("MCP Tool executed: %s", SELECT_ELEMENTS_TOOL_NAME)
@@ -150,7 +202,11 @@ def select_elements_by_id_handler(
     result = services.revit_client.call_listener(
         command_path="/select_elements_by_id",
         method="POST",
-        payload_data={"element_ids": processed_element_ids},
+        payload_data={
+            "element_ids": processed_element_ids,
+            "focus": bool(focus),
+            "refresh_view": bool(refresh_view),
+        },
     )
     if result.get("status") == "success" and result_handle:
         result["result_handle"] = result_handle
@@ -238,7 +294,7 @@ def select_stored_elements_handler(
     result = services.revit_client.call_listener(
         command_path="/select_elements_focused",
         method="POST",
-        payload_data={"element_ids": element_ids},
+        payload_data={"element_ids": element_ids, "focus": True, "refresh_view": True},
     )
     if result.get("status") == "error":
         if services.revit_client.is_route_not_defined(result, "/select_elements_focused") or "select_elements_focused" in str(
@@ -250,7 +306,7 @@ def select_stored_elements_handler(
             fallback_result = services.revit_client.call_listener(
                 command_path="/select_elements_by_id",
                 method="POST",
-                payload_data={"element_ids": element_ids},
+                payload_data={"element_ids": element_ids, "focus": True, "refresh_view": True},
             )
             if fallback_result.get("status") == "success":
                 fallback_result["approach_note"] = "Fallback selection used because focused selection route was unavailable"
@@ -475,7 +531,37 @@ def _compare_numeric_values(candidate_value, expected_value, operator):
     return False
 
 
-def _parse_length_to_internal_feet(value):
+def _convert_length_magnitude_to_internal_feet(magnitude, unit):
+    if unit in ("millimeters", "millimeter", "mm"):
+        return magnitude / 304.8
+    if unit in ("centimeters", "centimeter", "cm"):
+        return magnitude / 30.48
+    if unit in ("meters", "meter", "m"):
+        return magnitude / 0.3048
+    if unit in ("inches", "inch", "in"):
+        return magnitude / 12.0
+    if unit in ("feet", "foot", "ft"):
+        return magnitude
+    return magnitude
+
+
+def _infer_length_unit(value):
+    value_str = _collapse_whitespace(value).lower()
+    if not value_str:
+        return None
+    if "'" in value_str or '"' in value_str:
+        return "ft"
+
+    unit_match = re.search(
+        r"[-+]?\d[\d,]*(?:\.\d+)?\s*(millimeters|millimeter|mm|centimeters|centimeter|cm|meters|meter|m|feet|foot|ft|inches|inch|in)\b",
+        value_str,
+    )
+    if unit_match:
+        return unit_match.group(1)
+    return None
+
+
+def _parse_length_to_internal_feet(value, default_unit=None):
     value_str = _collapse_whitespace(value)
     if not value_str:
         raise ValueError("Length value is empty.")
@@ -497,7 +583,7 @@ def _parse_length_to_internal_feet(value):
 
         return feet + (inches / 12.0)
 
-    normalized_value = value_str.lower()
+    normalized_value = value_str.lower().replace(",", "")
     unit_match = re.match(
         r"^([-+]?\d*\.?\d+)\s*(millimeters|millimeter|mm|centimeters|centimeter|cm|meters|meter|m|feet|foot|ft|inches|inch|in)?$",
         normalized_value,
@@ -508,23 +594,12 @@ def _parse_length_to_internal_feet(value):
     magnitude = float(unit_match.group(1))
     unit = unit_match.group(2)
     if not unit:
-        return magnitude
+        unit = default_unit
 
-    if unit in ("millimeters", "millimeter", "mm"):
-        return magnitude / 304.8
-    if unit in ("centimeters", "centimeter", "cm"):
-        return magnitude / 30.48
-    if unit in ("meters", "meter", "m"):
-        return magnitude / 0.3048
-    if unit in ("inches", "inch", "in"):
-        return magnitude / 12.0
-    if unit in ("feet", "foot", "ft"):
-        return magnitude
-
-    return magnitude
+    return _convert_length_magnitude_to_internal_feet(magnitude, unit)
 
 
-def _matches_filter_value(candidate_value, expected_value, operator="contains", case_sensitive=False, typed_value=None):
+def _matches_filter_value(candidate_value, expected_value, operator="equals", case_sensitive=False, typed_value=None):
     candidate = "" if candidate_value in (None, "Not available") else str(candidate_value)
     expected = "" if expected_value is None else str(expected_value)
     normalized_operator = _normalize_filter_operator(operator)
@@ -537,17 +612,21 @@ def _matches_filter_value(candidate_value, expected_value, operator="contains", 
     if _is_numeric_operator(normalized_operator):
         numeric_candidate = None
         storage_type = None
+        default_length_unit = None
         if isinstance(typed_value, dict):
             storage_type = typed_value.get("storage_type")
+            default_length_unit = _infer_length_unit(typed_value.get("display_value"))
             if typed_value.get("is_numeric") and typed_value.get("numeric_value") is not None:
                 numeric_candidate = float(typed_value.get("numeric_value"))
+        if not default_length_unit:
+            default_length_unit = _infer_length_unit(candidate)
 
         if numeric_candidate is None:
             return False, "Parameter value is not numeric/filterable with operator '{}'.".format(normalized_operator)
 
         try:
-            if storage_type == "Double":
-                expected_numeric = _parse_length_to_internal_feet(expected)
+            if str(storage_type or "").endswith("Double"):
+                expected_numeric = _parse_length_to_internal_feet(expected, default_unit=default_length_unit)
             else:
                 expected_numeric = float(_collapse_whitespace(expected))
         except Exception:
@@ -602,7 +681,7 @@ def filter_stored_elements_by_parameter_handler(
     parameter_name: str,
     value: str = None,
     values: list[str] = None,
-    operator: str = "contains",
+    operator: str = "equals",
     match_mode: str = "any",
     result_handle: str = None,
     category_name: str = None,
@@ -791,6 +870,8 @@ def get_element_properties_handler(
     result_handle: str = None,
     include_all_parameters: bool = False,
     populated_only: bool = False,
+    offset: int = 0,
+    limit: int = None,
     **_kwargs,
 ) -> dict:
     resolved_ids, _record, resolve_error = services.result_store.resolve_element_ids(
@@ -801,6 +882,7 @@ def get_element_properties_handler(
         return resolve_error
 
     requested_count = len(resolved_ids)
+    source_count = requested_count
     truncated_for_safety = False
     if requested_count > services.config.max_elements_for_property_read:
         resolved_ids = resolved_ids[: services.config.max_elements_for_property_read]
@@ -812,9 +894,45 @@ def get_element_properties_handler(
             services.config.max_elements_for_property_read,
         )
 
-    services.logger.info("MCP Tool executed: %s with %s elements", GET_ELEMENT_PROPERTIES_TOOL_NAME, len(resolved_ids))
+    pageable_count = len(resolved_ids)
+    page_offset = _bounded_int(offset, 0, min_value=0, max_value=pageable_count)
+    max_page_size = max(1, int(services.config.max_records_in_response))
+    default_page_size = min(max_page_size, pageable_count) if pageable_count else max_page_size
+    page_limit = _bounded_int(limit, default_page_size, min_value=1, max_value=max_page_size)
+    page_ids = resolved_ids[page_offset : page_offset + page_limit]
+    next_offset = page_offset + len(page_ids)
+    has_more = next_offset < pageable_count
 
-    payload = {"element_ids": resolved_ids}
+    services.logger.info(
+        "MCP Tool executed: %s with %s source elements, page offset=%s limit=%s",
+        GET_ELEMENT_PROPERTIES_TOOL_NAME,
+        pageable_count,
+        page_offset,
+        page_limit,
+    )
+
+    if not page_ids:
+        result = {
+            "status": "success",
+            "message": "Retrieved properties for 0 elements.",
+            "count": 0,
+            "elements": [],
+            "source_count": source_count,
+            "pageable_count": pageable_count,
+            "page_offset": page_offset,
+            "page_limit": page_limit,
+            "returned_count": 0,
+            "has_more": False,
+            "next_offset": None,
+        }
+        if result_handle:
+            result["result_handle"] = result_handle
+        if truncated_for_safety:
+            result["truncated_for_safety"] = True
+            result["safety_limit"] = services.config.max_elements_for_property_read
+        return result
+
+    payload = {"element_ids": page_ids}
     if parameter_names:
         payload["parameter_names"] = parameter_names
     if include_all_parameters:
@@ -835,14 +953,27 @@ def get_element_properties_handler(
         }
     if result.get("status") == "success" and result_handle:
         result["result_handle"] = result_handle
-    if result.get("status") == "success" and truncated_for_safety:
-        result["requested_count"] = requested_count
-        result["processed_count"] = len(resolved_ids)
-        result["truncated_for_safety"] = True
-        result["message"] = (
-            "Retrieved properties for {} elements (safety-capped from {}). Narrow with filter_elements for "
-            "full-accuracy bulk analysis."
-        ).format(len(resolved_ids), requested_count)
+    if result.get("status") == "success":
+        returned_count = len(result.get("elements", []) or [])
+        result["source_count"] = source_count
+        result["pageable_count"] = pageable_count
+        result["page_offset"] = page_offset
+        result["page_limit"] = page_limit
+        result["returned_count"] = returned_count
+        result["has_more"] = has_more
+        result["next_offset"] = next_offset if has_more else None
+        result["message"] = "Retrieved properties for {} of {} elements (offset {}, limit {}).".format(
+            returned_count,
+            pageable_count,
+            page_offset,
+            page_limit,
+        )
+        if has_more:
+            result["message"] += " Call again with offset={} for the next page.".format(next_offset)
+        if truncated_for_safety:
+            result["requested_count"] = requested_count
+            result["truncated_for_safety"] = True
+            result["safety_limit"] = services.config.max_elements_for_property_read
     return services.result_store.compact_result_payload(result)
 
 
@@ -941,6 +1072,27 @@ def build_element_tools() -> list[ToolDefinition]:
             handler=get_active_selection_handler,
         ),
         ToolDefinition(
+            name=GET_REVIT_DIAGNOSTICS_TOOL_NAME,
+            description=(
+                "Returns the live pyRevit route context: Revit process, active document, active view, current selection, "
+                "open documents, route version, and optionally whether Revit can start a transaction right now."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "check_write_context": {
+                        "type": "boolean",
+                        "description": "When true, attempts a no-op Revit transaction and rolls it back to verify write context.",
+                    },
+                    "selection_limit": {
+                        "type": "integer",
+                        "description": "Maximum selected elements to include in the diagnostic sample. Default 20.",
+                    },
+                },
+            },
+            handler=get_revit_diagnostics_handler,
+        ),
+        ToolDefinition(
             name=GET_ELEMENTS_BY_CATEGORY_TOOL_NAME,
             description=(
                 "Retrieves and stores all elements in the current Revit model for the specified category. Use this "
@@ -957,19 +1109,33 @@ def build_element_tools() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name=SELECT_ELEMENTS_TOOL_NAME,
-            description="DEPRECATED - Prefer select_stored_elements. Selects elements by exact IDs or by a stored result_handle.",
+            description=(
+                "DEPRECATED - Prefer select_stored_elements. Selects elements by exact IDs or by a stored result_handle. "
+                "By default it focuses the active view on the selected elements and returns selection/view diagnostics."
+            ),
             json_schema={
                 "type": "object",
                 "properties": {
                     "element_ids": {"type": "array", "items": {"type": "string"}},
                     "result_handle": {"type": "string"},
+                    "focus": {
+                        "type": "boolean",
+                        "description": "When true, calls Revit ShowElements after selecting. Default true.",
+                    },
+                    "refresh_view": {
+                        "type": "boolean",
+                        "description": "When true, refreshes the active view after selecting. Default true.",
+                    },
                 },
             },
             handler=select_elements_by_id_handler,
         ),
         ToolDefinition(
             name=SELECT_STORED_ELEMENTS_TOOL_NAME,
-            description="Selects elements previously retrieved by get_elements_by_category or filter_elements. Prefer using result_handle to avoid passing large element lists.",
+            description=(
+                "Selects elements previously retrieved by get_elements_by_category or filter_elements, then focuses "
+                "the active Revit view on the selected elements. Prefer result_handle to avoid passing large lists."
+            ),
             json_schema={
                 "type": "object",
                 "properties": {
@@ -989,7 +1155,8 @@ def build_element_tools() -> list[ToolDefinition]:
             name=FILTER_ELEMENTS_TOOL_NAME,
             description=(
                 "Filters elements by category, level, and parameter conditions. Supports string operators plus "
-                "numeric range operators for numeric and length parameters."
+                "numeric range operators for numeric and length parameters. Bare length numbers are interpreted "
+                "using the parameter's displayed unit when available."
             ),
             json_schema={
                 "type": "object",
@@ -1038,7 +1205,13 @@ def build_element_tools() -> list[ToolDefinition]:
                     "result_handle": {"type": "string"},
                     "category_name": {"type": "string"},
                     "parameter_name": {"type": "string"},
-                    "value": {"type": "string", "description": "Single comparison value. Use values for bulk matching."},
+                    "value": {
+                        "type": "string",
+                        "description": (
+                            "Single comparison value. Use values for bulk matching. For length parameters, explicit "
+                            "units like '1800 mm' are accepted; bare numbers use the parameter's displayed unit."
+                        ),
+                    },
                     "values": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -1066,7 +1239,10 @@ def build_element_tools() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name=GET_ELEMENT_PROPERTIES_TOOL_NAME,
-            description="Gets parameter values for specified elements. Prefer result_handle over raw element_ids for large result sets.",
+            description=(
+                "Gets parameter values for specified elements. Prefer result_handle over raw element_ids for large "
+                "result sets. Results are paged; use offset and limit to retrieve every page when has_more is true."
+            ),
             json_schema={
                 "type": "object",
                 "properties": {
@@ -1075,6 +1251,14 @@ def build_element_tools() -> list[ToolDefinition]:
                     "parameter_names": {"type": "array", "items": {"type": "string"}},
                     "include_all_parameters": {"type": "boolean"},
                     "populated_only": {"type": "boolean"},
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based page offset into the resolved element list. Use next_offset from the previous response.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum elements to return for this page. Capped by the server response page size.",
+                    },
                 },
             },
             handler=get_element_properties_handler,

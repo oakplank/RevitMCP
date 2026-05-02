@@ -25,9 +25,15 @@ from RevitMCP_ExternalServer.providers.anthropic_provider import run_anthropic_c
 from RevitMCP_ExternalServer.providers.google_provider import run_google_chat
 from RevitMCP_ExternalServer.providers.openai_provider import run_openai_chat
 from RevitMCP_ExternalServer.tools.context_tools import resolve_revit_targets_internal
-from RevitMCP_ExternalServer.tools.element_tools import filter_stored_elements_by_parameter_handler
+from RevitMCP_ExternalServer.tools.element_tools import (
+    filter_stored_elements_by_parameter_handler,
+    get_element_properties_handler,
+    get_revit_diagnostics_handler,
+    select_elements_by_id_handler,
+)
 from RevitMCP_ExternalServer.tools.registry import build_tool_registry
 from RevitMCP_ExternalServer.web.chat_service import run_chat_request
+from routes.json_safety import sanitize_for_json
 
 
 class BootstrapTests(unittest.TestCase):
@@ -82,8 +88,11 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("values", stored_filter_schema["properties"])
         self.assertIn("match_mode", stored_filter_schema["properties"])
         self.assertEqual(stored_filter_schema["required"], ["parameter_name"])
+        self.assertIn("offset", definition_map["get_element_properties"].json_schema["properties"])
+        self.assertIn("limit", definition_map["get_element_properties"].json_schema["properties"])
         self.assertIn("get_revit_memory_context", definition_map)
         self.assertIn("save_revit_memory_note", definition_map)
+        self.assertIn("get_revit_diagnostics", definition_map)
 
     def test_dispatch_known_and_unknown_tool(self):
         app, _mcp_server, services, registry = create_application(
@@ -98,6 +107,20 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(unknown_result["status"], "error")
         self.assertIn("Unknown tool", unknown_result["message"])
         self.assertIsNotNone(app)
+
+
+class RouteJsonSafetyTests(unittest.TestCase):
+    def test_sanitize_for_json_escapes_non_ascii_text_and_bytes(self):
+        payload = {
+            "views": [
+                {"name": "Café Section", "sheet_name": b"Etage \xe9"},
+            ]
+        }
+
+        sanitized = sanitize_for_json(payload)
+
+        self.assertEqual(sanitized["views"][0]["name"], "Caf\\xe9 Section")
+        self.assertEqual(sanitized["views"][0]["sheet_name"], "Etage \\xe9")
 
 
 class ProviderTests(unittest.TestCase):
@@ -306,6 +329,62 @@ class ChatServiceTests(unittest.TestCase):
 
 
 class ElementToolTests(unittest.TestCase):
+    def test_get_revit_diagnostics_calls_diagnostic_route_with_write_check(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "route_version": "test-version",
+                    "document_state": {"title": "Model.rvt"},
+                    "write_context_check": {"attempted": True, "can_start_transaction": False},
+                }
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            result_store=SimpleNamespace(compact_result_payload=lambda result, preserve_keys=None: result),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = get_revit_diagnostics_handler(services, check_write_context=True, selection_limit=500)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/diagnostics/revit_state")
+        self.assertEqual(calls[0][1], "POST")
+        self.assertTrue(calls[0][2]["check_write_context"])
+        self.assertEqual(calls[0][2]["selection_limit"], 200)
+
+    def test_select_elements_requests_focus_and_refresh_by_default(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {"status": "success", "selected_count": len(payload_data["element_ids"])}
+
+        class FakeResultStore:
+            def resolve_element_ids(self, element_ids=None, result_handle=None):
+                return element_ids, None, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = select_elements_by_id_handler(services, element_ids=["101", 102])
+
+        self.assertEqual(result["selected_count"], 2)
+        self.assertEqual(calls[0][0], "/select_elements_by_id")
+        self.assertEqual(calls[0][2]["element_ids"], ["101", "102"])
+        self.assertTrue(calls[0][2]["focus"])
+        self.assertTrue(calls[0][2]["refresh_view"])
+
     def test_filter_stored_elements_supports_multi_value_any_match(self):
         property_reads = []
 
@@ -381,6 +460,155 @@ class ElementToolTests(unittest.TestCase):
         self.assertEqual(result["element_ids"], ["101", "103"])
         self.assertEqual(len(property_reads), 1)
         self.assertEqual(property_reads[0][0], "/elements/get_properties")
+
+    def test_filter_stored_elements_interprets_bare_length_using_display_units(self):
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                return {
+                    "status": "success",
+                    "elements": [
+                        {
+                            "element_id": "201",
+                            "properties": {"Side 1": "1523 mm"},
+                            "typed_properties": {
+                                "Side 1": {
+                                    "storage_type": "StorageType.Double",
+                                    "is_numeric": True,
+                                    "numeric_value": 1523 / 304.8,
+                                    "display_value": "1523 mm",
+                                }
+                            },
+                        },
+                        {
+                            "element_id": "202",
+                            "properties": {"Side 1": "2000 mm"},
+                            "typed_properties": {
+                                "Side 1": {
+                                    "storage_type": "StorageType.Double",
+                                    "is_numeric": True,
+                                    "numeric_value": 2000 / 304.8,
+                                    "display_value": "2000 mm",
+                                }
+                            },
+                        },
+                    ],
+                }
+
+            def is_route_not_defined(self, *_args, **_kwargs):
+                return False
+
+        class FakeResultStore:
+            def resolve_element_ids(self, **_kwargs):
+                return ["201", "202"], {"storage_key": "windows"}, None
+
+            def normalize_storage_key(self, value):
+                return str(value or "").lower().replace(" ", "_")
+
+            def store_elements(self, category_name, element_ids, count):
+                self.stored = (category_name, element_ids, count)
+                return category_name, "res_filtered"
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(
+                min_confidence_for_parameter_remap=0.82,
+                default_server_filter_batch_size=600,
+                max_records_in_response=20,
+            ),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        with patch(
+            "RevitMCP_ExternalServer.tools.element_tools.resolve_revit_targets_internal",
+            return_value={"status": "success", "resolved": {"parameter_names": {}}},
+        ):
+            result = filter_stored_elements_by_parameter_handler(
+                services,
+                parameter_name="Side 1",
+                value="1800",
+                operator="greater_than",
+                result_handle="res_source",
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["element_ids"], ["202"])
+
+    def test_get_element_properties_pages_stored_result_handles(self):
+        property_reads = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                property_reads.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "count": len(payload_data["element_ids"]),
+                    "elements": [
+                        {
+                            "element_id": element_id,
+                            "properties": {"Element_Name": "Residential Door"},
+                            "typed_properties": {},
+                        }
+                        for element_id in payload_data["element_ids"]
+                    ],
+                }
+
+            def is_route_not_defined(self, *_args, **_kwargs):
+                return False
+
+        class FakeResultStore:
+            def resolve_element_ids(self, **_kwargs):
+                return [str(value) for value in range(1, 46)], {"storage_key": "doors"}, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(
+                max_elements_for_property_read=300,
+                max_records_in_response=20,
+            ),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        first_page = get_element_properties_handler(
+            services,
+            result_handle="res_doors",
+            parameter_names=["Element_Name"],
+        )
+        second_page = get_element_properties_handler(
+            services,
+            result_handle="res_doors",
+            parameter_names=["Element_Name"],
+            offset=20,
+            limit=20,
+        )
+        last_page = get_element_properties_handler(
+            services,
+            result_handle="res_doors",
+            parameter_names=["Element_Name"],
+            offset=40,
+            limit=20,
+        )
+
+        self.assertEqual(first_page["returned_count"], 20)
+        self.assertTrue(first_page["has_more"])
+        self.assertEqual(first_page["next_offset"], 20)
+        self.assertEqual(second_page["elements"][0]["element_id"], "21")
+        self.assertEqual(second_page["elements"][-1]["element_id"], "40")
+        self.assertEqual(second_page["next_offset"], 40)
+        self.assertEqual(last_page["returned_count"], 5)
+        self.assertFalse(last_page["has_more"])
+        self.assertIsNone(last_page["next_offset"])
+        self.assertEqual(property_reads[0][2]["element_ids"], [str(value) for value in range(1, 21)])
+        self.assertEqual(property_reads[1][2]["element_ids"], [str(value) for value in range(21, 41)])
+        self.assertEqual(property_reads[2][2]["element_ids"], [str(value) for value in range(41, 46)])
 
 
 class ContextToolMemoryTests(unittest.TestCase):
