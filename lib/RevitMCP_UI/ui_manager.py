@@ -10,10 +10,9 @@ This script will be part of a pyRevit extension's lib folder and will be respons
 import subprocess
 import os
 import sys
-# import shutil # For finding executables
 import json
 import tempfile
-import datetime # Added for timestamps in settings
+import datetime
 
 # --- Configuration ---
 
@@ -40,7 +39,6 @@ MIN_PYTHON_VERSION = (3, 7)
 REQUIRED_PACKAGES = ["flask", "requests", "openai", "anthropic", "google-generativeai"]
 
 # Define subprocess creation flags for suppressing console windows on Windows
-# subprocess_creation_flags = 0 # TEMPORARILY SET TO 0 FOR DEBUGGING
 subprocess_creation_flags = 0 # Default for non-Windows
 if os.name == 'nt':
     try:
@@ -85,8 +83,6 @@ def _get_settings_file_path():
     return os.path.join(user_data_dir, SETTINGS_FILE_NAME)
 
 def _get_default_settings():
-    # import datetime # Already imported at the top of the file now
-    # Get current timestamp in ISO format
     # IronPython's datetime might not have isoformat() directly, build it manually
     now = datetime.datetime.now()
     timestamp = "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}.{:06d}".format(
@@ -155,7 +151,6 @@ def _save_settings_file(settings_data):
             print("[UI_MANAGER] Created user_data directory: {}".format(user_data_dir))
 
         # Update 'last_updated' timestamp
-        # import datetime # Already imported
         now = datetime.datetime.now()
         settings_data["last_updated"] = "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}.{:06d}".format(
             now.year, now.month, now.day,
@@ -350,20 +345,13 @@ def show_alert(message, title="RevitMCP"):
 def start_external_server():
     global SERVER_PROCESS
     
-    # --- NEW: Ensure settings file exists/is loaded ---
     print("[UI_MANAGER] Ensuring settings file is available...")
-    current_settings = get_or_create_settings() # Ensure this function is defined above
+    current_settings = get_or_create_settings()
     if not current_settings:
         show_alert("Critical error: Could not load or create settings file. Server cannot start.", title="RevitMCP Settings Error")
         return
-    # Example: You could retrieve a preferred Python path from settings here if desired
-    # configured_python_path = current_settings.get("setup", {}).get("python_path")
-    # if configured_python_path:
-    #     print("[UI_MANAGER] Using Python path from settings: {}".format(configured_python_path))
-    #     # Potentially set CPYTHON_EXECUTABLE_OVERRIDE = configured_python_path
-    #     # or pass it directly to find_cpython_executable if it accepts arguments.
 
-    print("[UI_MANAGER] Attempting to start external server...") 
+    print("[UI_MANAGER] Attempting to start external server...")
     python_exe_to_use = find_cpython_executable()
     if not python_exe_to_use:
         print("[UI_MANAGER] Python executable not found or configured.") 
@@ -388,21 +376,10 @@ def start_external_server():
         print("[UI_MANAGER] Selected server surface: {}".format(preferred_surface))
         try:
             env = os.environ.copy()
-            # Comment out or remove log file redirection
-            # log_file_path = os.path.join(LIB_ROOT, "revitmcp_server.log")
-            # print("[UI_MANAGER] External server stdout/stderr will be logged to: {}".format(log_file_path))
-            
-            # Open the log file in write mode to overwrite previous logs
-            # with open(log_file_path, 'w') as log_file:
             print("[UI_MANAGER] Starting Popen with command: {}".format(' '.join(launch_cmd)))
             SERVER_PROCESS = subprocess.Popen(
                 launch_cmd,
                 env=env,
-                # stdout=log_file, # Removed to allow output to CMD
-                # stderr=log_file, # Removed to allow output to CMD
-                # For Windows, to avoid opening a new console window for the subprocess if it's a GUI-less script
-                # or if you want to explicitly manage its console.
-                # creationflags=subprocess.CREATE_NO_WINDOW # Keep this commented unless a separate window is not desired
             )
             success_msg = "[UI_MANAGER] RevitMCP External Server process started (surface: {}). PID: {}. Its console window should appear.".format(preferred_surface, SERVER_PROCESS.pid)
             print(success_msg)
@@ -557,21 +534,3 @@ if __name__ == "__main__":
 
     print("\nTest mode finished.")
 
-# --- For actual pyRevit integration ---
-# The following would be in separate script.py files for each pushbutton
-
-# Example for StartServer.pushbutton/script.py:
-# ```python
-# #!/usr/bin/python
-# # -*- coding: UTF-8 -*-
-# from RevitMCP_UI import ui_manager # Assuming RevitMCP_UI is in a path recognized by pyRevit
-# ui_manager.start_external_server()
-# ```
-
-# Example for StopServer.pushbutton/script.py:
-# ```python
-# #!/usr/bin/python
-# # -*- coding: UTF-8 -*-
-# from RevitMCP_UI import ui_manager
-# ui_manager.stop_external_server()
-# ``` 

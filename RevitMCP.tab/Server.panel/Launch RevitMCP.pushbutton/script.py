@@ -4,7 +4,7 @@
 """Starts the RevitMCP External CPython Server."""
 
 # pyRevit automatically adds the extension's 'lib' folder to sys.path.
-# Modules (RevitMCP_RevitListener, RevitMCP_UI) placed in 'lib' are directly importable.
+# RevitMCP_UI is directly importable; startup.py registers HTTP routes from lib/routes.
 
 print("pyRevit Button: Launch RevitMCP - Attempting to load UI manager...")
 
