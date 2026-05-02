@@ -1,5 +1,12 @@
 # RevitMCP: Element-related HTTP routes
 # -*- coding: UTF-8 -*-
+#
+# Handlers declare `doc`, `uidoc`, or `uiapp` as parameter names so pyRevit's
+# Routes framework injects them on the UI thread (see
+# https://docs.pyrevitlabs.io/reference/pyrevit/routes/server/handler/). Do NOT
+# reach for `__revit__.ActiveUIDocument` from the worker thread — that's how
+# you end up with "modifications are temporarily disabled" and a null
+# ActiveView.
 
 import difflib
 import re
@@ -8,6 +15,17 @@ import unicodedata
 import System
 from pyrevit import routes, script, DB
 from System.Collections.Generic import List
+
+from routes.json_safety import sanitize_for_json
+
+
+ROUTE_DIAGNOSTIC_VERSION = "2026-05-02-strong-selection-diagnostics"
+
+
+try:
+    STRING_TYPES = (basestring,)
+except NameError:
+    STRING_TYPES = (str,)
 
 
 def _coerce_text(value):
@@ -148,7 +166,10 @@ def _resolve_built_in_category(category_name, route_logger, doc=None):
     return None
 
 
-def _find_parameter(element, param_name):
+def _find_parameter_on_element(element, param_name):
+    if not element:
+        return None
+
     # First try direct lookup by displayed parameter name.
     p = element.LookupParameter(param_name)
     if p:
@@ -172,6 +193,36 @@ def _find_parameter(element, param_name):
                 return item
 
     return None
+
+
+def _get_type_element(element, doc=None):
+    try:
+        symbol = getattr(element, "Symbol", None)
+        if symbol:
+            return symbol
+    except Exception:
+        pass
+
+    if not doc:
+        return None
+
+    try:
+        if hasattr(element, "GetTypeId"):
+            type_id = element.GetTypeId()
+            if type_id and type_id != DB.ElementId.InvalidElementId:
+                return doc.GetElement(type_id)
+    except Exception:
+        return None
+
+    return None
+
+
+def _find_parameter(element, param_name, doc=None, include_type=False):
+    param = _find_parameter_on_element(element, param_name)
+    if param or not include_type:
+        return param
+
+    return _find_parameter_on_element(_get_type_element(element, doc), param_name)
 
 
 def _get_parameter_display_value(param, doc):
@@ -245,7 +296,37 @@ def _is_meaningful_value(value):
     return True
 
 
-def _parse_length_to_internal_feet(value):
+def _convert_length_magnitude_to_internal_feet(magnitude, unit):
+    if unit in ("millimeters", "millimeter", "mm"):
+        return magnitude / 304.8
+    if unit in ("centimeters", "centimeter", "cm"):
+        return magnitude / 30.48
+    if unit in ("meters", "meter", "m"):
+        return magnitude / 0.3048
+    if unit in ("inches", "inch", "in"):
+        return magnitude / 12.0
+    if unit in ("feet", "foot", "ft"):
+        return magnitude
+    return magnitude
+
+
+def _infer_length_unit(value):
+    value_str = _collapse_whitespace(value).lower()
+    if not value_str:
+        return None
+    if "'" in value_str or '"' in value_str:
+        return "ft"
+
+    unit_match = re.search(
+        r"[-+]?\d[\d,]*(?:\.\d+)?\s*(millimeters|millimeter|mm|centimeters|centimeter|cm|meters|meter|m|feet|foot|ft|inches|inch|in)\b",
+        value_str,
+    )
+    if unit_match:
+        return unit_match.group(1)
+    return None
+
+
+def _parse_length_to_internal_feet(value, default_unit=None):
     value_str = _collapse_whitespace(value)
     if not value_str:
         raise ValueError("Length value is empty.")
@@ -267,7 +348,7 @@ def _parse_length_to_internal_feet(value):
 
         return feet + (inches / 12.0)
 
-    normalized_value = value_str.lower()
+    normalized_value = value_str.lower().replace(",", "")
     unit_match = re.match(
         r"^([-+]?\d*\.?\d+)\s*(millimeters|millimeter|mm|centimeters|centimeter|cm|meters|meter|m|feet|foot|ft|inches|inch|in)?$",
         normalized_value,
@@ -278,20 +359,9 @@ def _parse_length_to_internal_feet(value):
     magnitude = float(unit_match.group(1))
     unit = unit_match.group(2)
     if not unit:
-        return magnitude
+        unit = default_unit
 
-    if unit in ("millimeters", "millimeter", "mm"):
-        return magnitude / 304.8
-    if unit in ("centimeters", "centimeter", "cm"):
-        return magnitude / 30.48
-    if unit in ("meters", "meter", "m"):
-        return magnitude / 0.3048
-    if unit in ("inches", "inch", "in"):
-        return magnitude / 12.0
-    if unit in ("feet", "foot", "ft"):
-        return magnitude
-
-    return magnitude
+    return _convert_length_magnitude_to_internal_feet(magnitude, unit)
 
 
 def _set_parameter_value(param, new_value):
@@ -316,16 +386,261 @@ def _set_parameter_value(param, new_value):
     return False, "Unsupported parameter type: {}".format(param.StorageType)
 
 
-def _normalize_element_ids(raw_ids):
-    """Parse incoming element IDs to a list of valid DB.ElementId values."""
-    valid_ids = List[DB.ElementId]()
+def _coerce_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().lower()
+    except Exception:
+        return default
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _get_revit_process_info():
+    info = {"pid": None, "process_name": None}
+    try:
+        process = System.Diagnostics.Process.GetCurrentProcess()
+        info["pid"] = process.Id
+        info["process_name"] = process.ProcessName
+    except Exception:
+        pass
+    return info
+
+
+def _get_active_view_context(uidoc=None, doc=None):
+    view = None
+    try:
+        view = uidoc.ActiveView if uidoc else None
+    except Exception:
+        view = None
+    if not view and doc:
+        try:
+            view = doc.ActiveView
+        except Exception:
+            view = None
+
+    if not view:
+        return {"has_active_view": False, "id": None, "name": None, "type": None}
+
+    context = {"has_active_view": True, "id": None, "name": None, "type": None}
+    try:
+        context["id"] = str(view.Id.IntegerValue)
+    except Exception:
+        pass
+    try:
+        context["name"] = view.Name
+    except Exception:
+        pass
+    try:
+        context["type"] = str(view.ViewType)
+    except Exception:
+        pass
+    return context
+
+
+def _get_document_write_state(doc, uidoc=None):
+    state = {
+        "has_document": bool(doc),
+        "title": None,
+        "path": None,
+        "is_read_only": None,
+        "is_modifiable": None,
+        "is_workshared": None,
+        "active_view": None,
+    }
+
+    if doc:
+        for key, attr_name in (
+            ("title", "Title"),
+            ("path", "PathName"),
+            ("is_read_only", "IsReadOnly"),
+            ("is_modifiable", "IsModifiable"),
+            ("is_workshared", "IsWorkshared"),
+        ):
+            try:
+                state[key] = getattr(doc, attr_name)
+            except Exception:
+                pass
+
+    try:
+        active_view = _get_active_view_context(uidoc, doc)
+        if active_view.get("has_active_view"):
+            state["active_view"] = active_view.get("name")
+            state["active_view_type"] = active_view.get("type")
+    except Exception:
+        pass
+
+    return state
+
+
+def _get_open_document_summaries(uiapp):
+    documents = []
+    try:
+        app = uiapp.Application if uiapp else None
+        for open_doc in app.Documents:
+            item = {"title": None, "path": None, "is_read_only": None, "is_modifiable": None}
+            for key, attr_name in (
+                ("title", "Title"),
+                ("path", "PathName"),
+                ("is_read_only", "IsReadOnly"),
+                ("is_modifiable", "IsModifiable"),
+            ):
+                try:
+                    item[key] = getattr(open_doc, attr_name)
+                except Exception:
+                    pass
+            documents.append(item)
+    except Exception:
+        pass
+    return documents
+
+
+def _get_element_level_name(element, doc):
+    built_in_names = (
+        "FAMILY_LEVEL_PARAM",
+        "INSTANCE_REFERENCE_LEVEL_PARAM",
+        "SCHEDULE_LEVEL_PARAM",
+        "WALL_BASE_CONSTRAINT",
+        "LEVEL_PARAM",
+    )
+    for built_in_name in built_in_names:
+        try:
+            if not hasattr(DB.BuiltInParameter, built_in_name):
+                continue
+            param = element.get_Parameter(getattr(DB.BuiltInParameter, built_in_name))
+            if not param or not getattr(param, "HasValue", False):
+                continue
+            level_id = param.AsElementId()
+            if level_id and level_id != DB.ElementId.InvalidElementId:
+                level = doc.GetElement(level_id)
+                if level and getattr(level, "Name", None):
+                    return level.Name
+        except Exception:
+            continue
+
+    try:
+        level_id = getattr(element, "LevelId", None)
+        if level_id and level_id != DB.ElementId.InvalidElementId:
+            level = doc.GetElement(level_id)
+            if level and getattr(level, "Name", None):
+                return level.Name
+    except Exception:
+        pass
+
+    return None
+
+
+def _get_selection_snapshot(uidoc, doc, limit=20):
+    snapshot = {
+        "selected_count": 0,
+        "sample_limit": limit,
+        "element_ids": [],
+        "elements": [],
+    }
+
+    try:
+        selected_ids = uidoc.Selection.GetElementIds()
+        snapshot["selected_count"] = selected_ids.Count
+        for elem_id in selected_ids:
+            if len(snapshot["element_ids"]) >= limit:
+                break
+            snapshot["element_ids"].append(str(elem_id.IntegerValue))
+            element = doc.GetElement(elem_id) if doc else None
+            if element:
+                snapshot["elements"].append(_build_element_summary(element, doc))
+    except Exception as error:
+        snapshot["error"] = str(error)
+
+    return snapshot
+
+
+def _build_revit_diagnostics(uiapp, uidoc, doc, selection_limit=20):
+    return {
+        "status": "success",
+        "message": "Revit diagnostic context retrieved.",
+        "route_version": ROUTE_DIAGNOSTIC_VERSION,
+        "process": _get_revit_process_info(),
+        "document_state": _get_document_write_state(doc, uidoc),
+        "active_view": _get_active_view_context(uidoc, doc),
+        "selection": _get_selection_snapshot(uidoc, doc, limit=selection_limit) if uidoc else None,
+        "open_documents": _get_open_document_summaries(uiapp),
+    }
+
+
+def handle_revit_diagnostics(uiapp, uidoc, doc, request):
+    route_logger = script.get_logger()
+
+    try:
+        payload = request.data if hasattr(request, 'data') else {}
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+        try:
+            selection_limit = int(payload.get('selection_limit', 20))
+        except Exception:
+            selection_limit = 20
+        selection_limit = max(0, min(200, selection_limit))
+
+        diagnostics = _build_revit_diagnostics(uiapp, uidoc, doc, selection_limit=selection_limit)
+        check_write_context = _coerce_bool(payload.get('check_write_context'), default=False)
+        diagnostics["write_context_check"] = {
+            "attempted": check_write_context,
+            "can_start_transaction": None,
+            "rollback_ok": None,
+            "error": None,
+        }
+
+        if check_write_context:
+            transaction = None
+            try:
+                transaction = DB.Transaction(doc, "RevitMCP Diagnostics Write Context")
+                transaction.Start()
+                diagnostics["write_context_check"]["can_start_transaction"] = True
+                try:
+                    transaction.RollBack()
+                    diagnostics["write_context_check"]["rollback_ok"] = True
+                except Exception as rollback_error:
+                    diagnostics["write_context_check"]["rollback_ok"] = False
+                    diagnostics["write_context_check"]["rollback_error"] = str(rollback_error)
+            except Exception as transaction_error:
+                diagnostics["write_context_check"]["can_start_transaction"] = False
+                diagnostics["write_context_check"]["error"] = str(transaction_error)
+                diagnostics["document_state"] = _get_document_write_state(doc, uidoc)
+
+        return sanitize_for_json(diagnostics)
+
+    except Exception as e:
+        route_logger.error("Error in /diagnostics/revit_state: {}".format(e), exc_info=True)
+        return routes.Response(
+            status=500,
+            data=sanitize_for_json({
+                "status": "error",
+                "error": "Internal server error retrieving Revit diagnostics.",
+                "details": str(e),
+                "route_version": ROUTE_DIAGNOSTIC_VERSION,
+                "document_state": _get_document_write_state(doc, uidoc),
+            }),
+        )
+
+
+def _normalize_element_id_values(raw_ids):
+    """Parse incoming element IDs without touching Revit API objects."""
+    valid_id_values = []
     requested_count = 0
     invalid_ids = []
 
     if raw_ids is None:
-        return valid_ids, requested_count, invalid_ids
+        return valid_id_values, requested_count, invalid_ids
 
-    if isinstance(raw_ids, str):
+    if isinstance(raw_ids, STRING_TYPES):
         raw_ids = [raw_ids]
 
     for raw_id in raw_ids:
@@ -333,13 +648,190 @@ def _normalize_element_ids(raw_ids):
         try:
             element_id_int = int(str(raw_id).strip())
             if element_id_int > 0:
-                valid_ids.Add(DB.ElementId(element_id_int))
+                valid_id_values.append(element_id_int)
             else:
                 invalid_ids.append(str(raw_id))
         except Exception:
             invalid_ids.append(str(raw_id))
 
-    return valid_ids, requested_count, invalid_ids
+    return valid_id_values, requested_count, invalid_ids
+
+
+def _select_element_id_values(uidoc, doc, element_id_values, requested_count, invalid_ids, refresh_view=True, focus=True):
+    valid_existing_ids = List[DB.ElementId]()
+    selected_ids_processed = []
+    missing_ids = []
+    selected_samples = []
+    levels_detected = []
+    level_names_seen = set()
+    elements_with_location = 0
+
+    for element_id_value in element_id_values:
+        elem_id = DB.ElementId(int(element_id_value))
+        element = doc.GetElement(elem_id)
+        if element:
+            valid_existing_ids.Add(elem_id)
+            selected_ids_processed.append(str(element_id_value))
+            if len(selected_samples) < 10:
+                selected_samples.append(_build_element_summary(element, doc))
+            try:
+                if getattr(element, "Location", None):
+                    elements_with_location += 1
+            except Exception:
+                pass
+            level_name = _get_element_level_name(element, doc)
+            if level_name and level_name not in level_names_seen:
+                level_names_seen.add(level_name)
+                levels_detected.append(level_name)
+        else:
+            missing_ids.append(str(element_id_value))
+
+    all_invalid_ids = list(invalid_ids or []) + missing_ids
+    selection_set = {
+        "attempted": True,
+        "applied": False,
+        "error": None,
+    }
+    try:
+        uidoc.Selection.SetElementIds(List[DB.ElementId]())
+        uidoc.Selection.SetElementIds(valid_existing_ids)
+        selection_set["applied"] = True
+    except Exception as selection_error:
+        selection_set["error"] = str(selection_error)
+        return routes.Response(
+            status=500,
+            data=sanitize_for_json({
+                "status": "error",
+                "error": "Failed to set Revit UI selection.",
+                "details": str(selection_error),
+                "route_version": ROUTE_DIAGNOSTIC_VERSION,
+                "requested_count": requested_count,
+                "valid_elements": valid_existing_ids.Count,
+                "invalid_input_ids": list(invalid_ids or []),
+                "missing_ids": missing_ids,
+                "invalid_ids": all_invalid_ids,
+                "selected_ids_processed": selected_ids_processed,
+                "selection_set": selection_set,
+                "view_context": _get_active_view_context(uidoc, doc),
+                "document_state": _get_document_write_state(doc, uidoc),
+                "selection_diagnostics": {
+                    "elements_with_location_sample_count": elements_with_location,
+                    "levels_detected": levels_detected,
+                    "sample_elements": selected_samples,
+                },
+                "threading_note": (
+                    "Selection failed while calling uidoc.Selection.SetElementIds. "
+                    "If details mention HandleEvent/UI thread, this route must be registered as a request-only "
+                    "startup handler and use __revit__.ActiveUIDocument, matching the previously working route."
+                ),
+            }),
+        )
+
+    show_elements = {
+        "attempted": False,
+        "applied": False,
+        "error": None,
+    }
+    if focus and valid_existing_ids.Count > 0:
+        show_elements["attempted"] = True
+        try:
+            selected_ids = uidoc.Selection.GetElementIds()
+            uidoc.ShowElements(selected_ids)
+            show_elements["applied"] = True
+        except Exception as show_error:
+            show_elements["error"] = str(show_error)
+
+    refresh_result = {"attempted": bool(refresh_view), "applied": False, "error": None}
+    if refresh_view:
+        try:
+            uidoc.RefreshActiveView()
+            refresh_result["applied"] = True
+        except Exception as refresh_error:
+            refresh_result["error"] = str(refresh_error)
+
+    actual_selection_count = 0
+    try:
+        actual_selection_count = uidoc.Selection.GetElementIds().Count
+    except Exception:
+        actual_selection_count = valid_existing_ids.Count
+
+    result = {
+        "status": "success",
+        "message": "Selected {} elements in Revit.".format(actual_selection_count),
+        "route_version": ROUTE_DIAGNOSTIC_VERSION,
+        "requested_count": requested_count,
+        "selected_count": actual_selection_count,
+        "valid_elements": valid_existing_ids.Count,
+        "invalid_input_ids": list(invalid_ids or []),
+        "missing_ids": missing_ids,
+        "invalid_ids": all_invalid_ids,
+        "selected_ids_processed": selected_ids_processed,
+        "focus_requested": bool(focus),
+        "selection_set": selection_set,
+        "show_elements": show_elements,
+        "refresh_view": refresh_result,
+        "view_context": _get_active_view_context(uidoc, doc),
+        "document_state": _get_document_write_state(doc, uidoc),
+        "selection_diagnostics": {
+            "actual_selection_count": actual_selection_count,
+            "elements_with_location_sample_count": elements_with_location,
+            "levels_detected": levels_detected,
+            "sample_elements": selected_samples,
+        },
+        "visibility_note": (
+            "ShowElements was requested for the selected IDs. If selected elements are still not visible, check active "
+            "view discipline, phase, design option, workset, crop, filters, or switch to a 3D view."
+        ),
+    }
+    return sanitize_for_json(result)
+
+
+def _perform_select_elements(uidoc, doc, request, route_logger):
+    """Body of the selection routes. Runs on Revit's UI thread because the
+    calling handler declares `uidoc`/`doc`, which makes pyRevit's Routes
+    framework dispatch via `IExternalEventHandler.Execute(uiapp)`."""
+    try:
+        payload = request.data if hasattr(request, 'data') else None
+        if not payload or not isinstance(payload, dict):
+            return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+        raw_ids = payload.get('element_ids')
+        if not raw_ids:
+            return routes.Response(status=400, data={"error": "Missing 'element_ids'"})
+
+        focus = _coerce_bool(payload.get('focus'), default=True)
+        refresh_view = _coerce_bool(payload.get('refresh_view'), default=True)
+        element_id_values, requested_count, invalid_ids = _normalize_element_id_values(raw_ids)
+
+        route_logger.info(
+            "Selecting {} requested IDs (focus={}, refresh_view={})".format(
+                requested_count,
+                focus,
+                refresh_view,
+            )
+        )
+
+        return _select_element_id_values(
+            uidoc,
+            doc,
+            element_id_values,
+            requested_count,
+            invalid_ids,
+            refresh_view=refresh_view,
+            focus=focus,
+        )
+
+    except Exception as e:
+        route_logger.error("Error in selection handler: {}".format(e), exc_info=True)
+        return routes.Response(
+            status=500,
+            data=sanitize_for_json({
+                "status": "error",
+                "error": "Internal server error in selection handler",
+                "details": str(e),
+                "route_version": ROUTE_DIAGNOSTIC_VERSION,
+            }),
+        )
 
 
 def _normalize_filter_operator(operator):
@@ -404,7 +896,10 @@ def _evaluate_parameter_filter(param, expected_value, operator, doc):
         if param.StorageType == DB.StorageType.Double:
             try:
                 candidate_value = float(param.AsDouble())
-                expected_numeric = _parse_length_to_internal_feet(expected_value)
+                expected_numeric = _parse_length_to_internal_feet(
+                    expected_value,
+                    default_unit=_infer_length_unit(_get_parameter_display_value(param, doc)),
+                )
             except Exception:
                 return (
                     False,
@@ -539,16 +1034,10 @@ def register_routes(api):
     """Register all element-related routes with the API"""
 
     @api.route('/views/active/info', methods=['GET'])
-    def handle_get_active_view_info(request):
+    def handle_get_active_view_info(uidoc, doc, request):
         route_logger = script.get_logger()
 
         try:
-            current_uiapp = __revit__
-            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
-                return routes.Response(status=503, data={"error": "No active UI document"})
-
-            uidoc = current_uiapp.ActiveUIDocument
-            doc = uidoc.Document
             active_view = uidoc.ActiveView
 
             if not active_view:
@@ -616,11 +1105,11 @@ def register_routes(api):
             }
 
         except Exception as e:
-            route_logger.critical("Error in /views/active/info: {}".format(e), exc_info=True)
+            route_logger.error("Error in /views/active/info: {}".format(e), exc_info=True)
             return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
 
     @api.route('/views/active/elements', methods=['POST'])
-    def handle_get_active_view_elements(request):
+    def handle_get_active_view_elements(uidoc, doc, request):
         route_logger = script.get_logger()
 
         try:
@@ -644,13 +1133,9 @@ def register_routes(api):
 
             requested_categories = [_normalize_category_key(name) for name in category_names if str(name or "").strip()]
 
-            current_uiapp = __revit__
-            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
-                return routes.Response(status=503, data={"error": "No active UI document"})
-
-            uidoc = current_uiapp.ActiveUIDocument
-            doc = uidoc.Document
             active_view = uidoc.ActiveView
+            if not active_view:
+                return routes.Response(status=503, data={"error": "No active Revit view"})
 
             collector = DB.FilteredElementCollector(doc, active_view.Id).WhereElementIsNotElementType()
 
@@ -692,11 +1177,11 @@ def register_routes(api):
             }
 
         except Exception as e:
-            route_logger.critical("Error in /views/active/elements: {}".format(e), exc_info=True)
+            route_logger.error("Error in /views/active/elements: {}".format(e), exc_info=True)
             return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
 
     @api.route('/selection/active', methods=['POST'])
-    def handle_get_active_selection(request):
+    def handle_get_active_selection(uidoc, doc, request):
         route_logger = script.get_logger()
 
         try:
@@ -712,12 +1197,6 @@ def register_routes(api):
                 limit = 200
             limit = max(1, min(2000, limit))
 
-            current_uiapp = __revit__
-            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
-                return routes.Response(status=503, data={"error": "No active UI document"})
-
-            uidoc = current_uiapp.ActiveUIDocument
-            doc = uidoc.Document
             selected_ids = uidoc.Selection.GetElementIds()
 
             element_ids = []
@@ -748,11 +1227,11 @@ def register_routes(api):
             }
 
         except Exception as e:
-            route_logger.critical("Error in /selection/active: {}".format(e), exc_info=True)
+            route_logger.error("Error in /selection/active: {}".format(e), exc_info=True)
             return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
 
     @api.route('/families/types', methods=['POST'])
-    def handle_list_family_types(request):
+    def handle_list_family_types(doc, request):
         route_logger = script.get_logger()
 
         try:
@@ -779,11 +1258,6 @@ def register_routes(api):
 
             requested_categories = [_normalize_category_key(name) for name in category_names if str(name or "").strip()]
 
-            current_uiapp = __revit__
-            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
-                return routes.Response(status=503, data={"error": "No active UI document"})
-
-            doc = current_uiapp.ActiveUIDocument.Document
             symbols = DB.FilteredElementCollector(doc).OfClass(DB.FamilySymbol).ToElements()
 
             family_types = []
@@ -833,15 +1307,14 @@ def register_routes(api):
             }
 
         except Exception as e:
-            route_logger.critical("Error in /families/types: {}".format(e), exc_info=True)
+            route_logger.error("Error in /families/types: {}".format(e), exc_info=True)
             return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
 
     @api.route('/get_elements_by_category', methods=['POST'])
-    def handle_get_elements_by_category(request):
+    def handle_get_elements_by_category(doc, request):
         """
         Handles POST requests to /revit-mcp-v1/get_elements_by_category
         Returns elements in Revit by category name (without selecting them).
-        Uses FilteredElementCollector with ToElementIds() for better performance.
         """
         route_logger = script.get_logger()
 
@@ -850,7 +1323,6 @@ def register_routes(api):
             return routes.Response(status=500, data={"error": "Internal server error: 'request' object is None.", "details": "The 'request' object was not provided to the handler by pyRevit."})
 
         try:
-            # Access the JSON payload from the request
             payload = request.data if hasattr(request, 'data') else None
             route_logger.info("Successfully accessed request.data. Type: {}, Value: {}".format(type(payload), payload))
 
@@ -864,14 +1336,6 @@ def register_routes(api):
                 route_logger.error("Missing 'category_name' in JSON body for /get_elements_by_category.")
                 return routes.Response(status=400, data={"error": "Missing 'category_name' in JSON request body."})
 
-            # Get document from __revit__
-            current_uiapp = __revit__
-            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
-                route_logger.error("Error in /get_elements_by_category: No active UI document.")
-                return routes.Response(status=503, data={"error": "No active Revit UI document found."})
-            doc = current_uiapp.ActiveUIDocument.Document
-
-            # Category validation and element collection
             built_in_category = _resolve_built_in_category(category_name_payload, route_logger, doc=doc)
             if not built_in_category:
                 route_logger.error("Invalid category_name: '{}'. Not a recognized BuiltInCategory.".format(category_name_payload))
@@ -910,70 +1374,19 @@ def register_routes(api):
             }
 
         except Exception as e_main_logic:
-            route_logger.critical("Critical error in /get_elements_by_category: {}".format(e_main_logic), exc_info=True)
+            route_logger.error("Critical error in /get_elements_by_category: {}".format(e_main_logic), exc_info=True)
             return routes.Response(status=500, data={"error": "Internal server error during main logic.", "details": str(e_main_logic)})
 
     @api.route('/select_elements_by_id', methods=['POST'])
-    def handle_select_elements_by_id(request):
-        """Select provided element IDs in the active document."""
-        route_logger = script.get_logger()
-
-        try:
-            payload = request.data if hasattr(request, 'data') else None
-            if not payload or not isinstance(payload, dict):
-                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
-
-            raw_ids = payload.get('element_ids')
-            if not raw_ids:
-                return routes.Response(status=400, data={"error": "Missing 'element_ids'"})
-
-            current_uiapp = __revit__
-            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
-                return routes.Response(status=503, data={"error": "No active Revit UI document"})
-
-            uidoc = current_uiapp.ActiveUIDocument
-            doc = uidoc.Document
-
-            candidate_ids, requested_count, invalid_ids = _normalize_element_ids(raw_ids)
-            valid_existing_ids = List[DB.ElementId]()
-            selected_ids_processed = []
-
-            for elem_id in candidate_ids:
-                if doc.GetElement(elem_id):
-                    valid_existing_ids.Add(elem_id)
-                    selected_ids_processed.append(str(elem_id.IntegerValue))
-
-            uidoc.Selection.SetElementIds(List[DB.ElementId]())
-            uidoc.Selection.SetElementIds(valid_existing_ids)
-
-            try:
-                uidoc.RefreshActiveView()
-            except Exception:
-                pass
-
-            return {
-                "status": "success",
-                "message": "Selected {} elements.".format(valid_existing_ids.Count),
-                "requested_count": requested_count,
-                "selected_count": valid_existing_ids.Count,
-                "invalid_ids": invalid_ids,
-                "selected_ids_processed": selected_ids_processed
-            }
-
-        except Exception as e:
-            route_logger.critical("Error in /select_elements_by_id: {}".format(e), exc_info=True)
-            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+    def handle_select_elements_by_id(uidoc, doc, request):
+        return _perform_select_elements(uidoc, doc, request, script.get_logger())
 
     @api.route('/select_elements_focused', methods=['POST'])
-    def handle_select_elements_focused(request):
-        """
-        Focused selection route used by external server.
-        Currently mirrors /select_elements_by_id behavior and keeps selection active.
-        """
-        return handle_select_elements_by_id(request)
+    def handle_select_elements_focused(uidoc, doc, request):
+        return _perform_select_elements(uidoc, doc, request, script.get_logger())
 
     @api.route('/elements/filter', methods=['POST'])
-    def handle_filter_elements(request):
+    def handle_filter_elements(doc, request):
         route_logger = script.get_logger()
 
         try:
@@ -987,12 +1400,6 @@ def register_routes(api):
 
             level_name = payload.get('level_name')
             parameter_filters = payload.get('parameters', [])
-
-            current_uiapp = __revit__
-            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
-                return routes.Response(status=503, data={"error": "No active UI document"})
-
-            doc = current_uiapp.ActiveUIDocument.Document
 
             built_in_category = _resolve_built_in_category(category_name, route_logger, doc=doc)
             if not built_in_category:
@@ -1042,7 +1449,7 @@ def register_routes(api):
                     if not param_name or expected_value is None:
                         continue
 
-                    param = _find_parameter(element, param_name)
+                    param = _find_parameter(element, param_name, doc=doc, include_type=True)
                     matched, filter_error = _evaluate_parameter_filter(param, expected_value, condition, doc)
                     if filter_error:
                         break
@@ -1070,11 +1477,11 @@ def register_routes(api):
             }
 
         except Exception as e:
-            route_logger.critical("Error in /elements/filter: {}".format(e), exc_info=True)
+            route_logger.error("Error in /elements/filter: {}".format(e), exc_info=True)
             return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
 
     @api.route('/elements/get_properties', methods=['POST'])
-    def handle_get_element_properties(request):
+    def handle_get_element_properties(doc, request):
         route_logger = script.get_logger()
 
         try:
@@ -1090,11 +1497,6 @@ def register_routes(api):
             include_all_parameters = bool(payload.get('include_all_parameters', False))
             populated_only = bool(payload.get('populated_only', False))
 
-            current_uiapp = __revit__
-            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
-                return routes.Response(status=503, data={"error": "No active UI document"})
-
-            doc = current_uiapp.ActiveUIDocument.Document
             results = []
 
             for id_str in element_ids_list:
@@ -1159,7 +1561,7 @@ def register_routes(api):
 
                     if not include_all_parameters:
                         for param_name in names_to_use:
-                            param = _find_parameter(element, param_name)
+                            param = _find_parameter(element, param_name, doc=doc, include_type=True)
                             _append_parameter_property(properties, typed_properties, param_name, param, doc)
 
                     # Enrich with stable, human-readable identity values.
@@ -1194,11 +1596,11 @@ def register_routes(api):
             }
 
         except Exception as e:
-            route_logger.critical("Error in /elements/get_properties: {}".format(e), exc_info=True)
+            route_logger.error("Error in /elements/get_properties: {}".format(e), exc_info=True)
             return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
 
     @api.route('/elements/update_parameters', methods=['POST'])
-    def handle_update_element_parameters(request):
+    def handle_update_element_parameters(uidoc, doc, request):
         route_logger = script.get_logger()
 
         try:
@@ -1210,15 +1612,25 @@ def register_routes(api):
             if not updates_list:
                 return routes.Response(status=400, data={"error": "Missing 'updates' list"})
 
-            current_uiapp = __revit__
-            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
-                return routes.Response(status=503, data={"error": "No active UI document"})
-
-            doc = current_uiapp.ActiveUIDocument.Document
             results = []
-
             transaction = DB.Transaction(doc, "Update Element Parameters")
-            transaction.Start()
+            try:
+                transaction.Start()
+            except Exception as transaction_start_error:
+                route_logger.error(
+                    "Could not start Update Element Parameters transaction: {}".format(transaction_start_error),
+                    exc_info=True,
+                )
+                return routes.Response(
+                    status=409,
+                    data={
+                        "status": "error",
+                        "error": "Could not start Revit transaction.",
+                        "details": str(transaction_start_error),
+                        "document_state": sanitize_for_json(_get_document_write_state(doc, uidoc)),
+                    },
+                )
+
             try:
                 for update_data in updates_list:
                     element_id_str = update_data.get('element_id')
@@ -1295,8 +1707,18 @@ def register_routes(api):
 
                 transaction.Commit()
             except Exception as transaction_error:
-                transaction.RollBack()
-                return routes.Response(status=500, data={"error": "Transaction failed", "details": str(transaction_error)})
+                try:
+                    transaction.RollBack()
+                except Exception:
+                    pass
+                return routes.Response(
+                    status=500,
+                    data={
+                        "error": "Transaction failed",
+                        "details": str(transaction_error),
+                        "document_state": sanitize_for_json(_get_document_write_state(doc, uidoc)),
+                    },
+                )
 
             success_count = len([r for r in results if r["status"] == "success"])
             partial_count = len([r for r in results if r["status"] == "partial"])
@@ -1315,5 +1737,12 @@ def register_routes(api):
             }
 
         except Exception as e:
-            route_logger.critical("Error in /elements/update_parameters: {}".format(e), exc_info=True)
-            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+            route_logger.error("Error in /elements/update_parameters: {}".format(e), exc_info=True)
+            return routes.Response(
+                status=500,
+                data={
+                    "status": "error",
+                    "error": "Internal server error in parameter update handler",
+                    "details": str(e),
+                },
+            )

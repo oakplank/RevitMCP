@@ -48,7 +48,7 @@ def register_routes(api):
     """Register schema/context discovery routes with the API."""
 
     @api.route('/schema/context', methods=['GET'])
-    def handle_get_schema_context(request):
+    def handle_get_schema_context(doc, request):
         """
         Returns canonical Revit schema context for resolver use:
         - BuiltInCategory names
@@ -58,14 +58,13 @@ def register_routes(api):
         """
         route_logger = script.get_logger()
 
+        if doc is None:
+            return routes.Response(
+                status=503,
+                data={"error": "No active Revit document. Open a project and retry."},
+            )
+
         try:
-            current_uiapp = __revit__
-            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
-                return routes.Response(status=503, data={"error": "No active Revit UI document found."})
-
-            uidoc = current_uiapp.ActiveUIDocument
-            doc = uidoc.Document
-
             # BuiltInCategory names (canonical values like OST_Walls)
             bic_names = []
             try:
@@ -167,5 +166,5 @@ def register_routes(api):
             return _sanitize_for_json(context)
 
         except Exception as e:
-            route_logger.critical("Error generating /schema/context: {}".format(e), exc_info=True)
+            route_logger.error("Error generating /schema/context: {}".format(e), exc_info=True)
             return routes.Response(status=500, data={"error": "Internal server error generating schema context.", "details": str(e)})
