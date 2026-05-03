@@ -18,6 +18,22 @@ def make_workspace_temp_file_path(prefix: str) -> str:
     return str(base_dir / "{}_{}.json".format(prefix, uuid.uuid4().hex))
 
 
+def make_workspace_temp_png_path(prefix: str) -> str:
+    base_dir = LIB_ROOT / "_tmp_testdata"
+    base_dir.mkdir(exist_ok=True)
+    return str(base_dir / "{}_{}.png".format(prefix, uuid.uuid4().hex))
+
+
+def write_tiny_png(path: str) -> None:
+    png_bytes = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xf8\xff"
+        b"\xff?\x00\x05\xfe\x02\xfeA\xe2!\xbc\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    with open(path, "wb") as handle:
+        handle.write(png_bytes)
+
+
 from RevitMCP_ExternalServer.bootstrap import create_application
 from RevitMCP_ExternalServer.core.memory_store import MemoryStore
 from RevitMCP_ExternalServer.core.runtime_config import resolve_runtime_surface
@@ -31,7 +47,17 @@ from RevitMCP_ExternalServer.tools.element_tools import (
     get_revit_diagnostics_handler,
     select_elements_by_id_handler,
 )
-from RevitMCP_ExternalServer.tools.registry import build_tool_registry
+from RevitMCP_ExternalServer.tools.element_operation_tools import (
+    delete_elements_handler,
+    override_element_graphics_handler,
+)
+from RevitMCP_ExternalServer.tools.model_tools import analyze_model_statistics_handler
+from RevitMCP_ExternalServer.tools.registry import ToolDefinition, ToolRegistry, build_tool_registry
+from RevitMCP_ExternalServer.tools.view_tools import (
+    activate_view_handler,
+    duplicate_view_handler,
+    export_active_view_image_handler,
+)
 from RevitMCP_ExternalServer.web.chat_service import run_chat_request
 from routes.json_safety import sanitize_for_json
 
@@ -93,6 +119,12 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("get_revit_memory_context", definition_map)
         self.assertIn("save_revit_memory_note", definition_map)
         self.assertIn("get_revit_diagnostics", definition_map)
+        self.assertIn("analyze_model_statistics", definition_map)
+        self.assertIn("override_element_graphics", definition_map)
+        self.assertIn("delete_elements", definition_map)
+        self.assertIn("activate_view", definition_map)
+        self.assertIn("export_active_view_image", definition_map)
+        self.assertIn("duplicate_view", definition_map)
 
     def test_dispatch_known_and_unknown_tool(self):
         app, _mcp_server, services, registry = create_application(
@@ -107,6 +139,41 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(unknown_result["status"], "error")
         self.assertIn("Unknown tool", unknown_result["message"])
         self.assertIsNotNone(app)
+
+    def test_mcp_callable_returns_image_content_for_image_artifact(self):
+        image_path = make_workspace_temp_png_path("mcp_artifact")
+        write_tiny_png(image_path)
+
+        def handler(_services, **_kwargs):
+            return {
+                "status": "success",
+                "artifact_type": "image",
+                "image_path": image_path,
+                "mime_type": "image/png",
+            }
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(warning=lambda *a, **k: None),
+        )
+        definition = ToolDefinition(
+            name="image_tool",
+            description="returns image",
+            json_schema={"type": "object", "properties": {}},
+            handler=handler,
+        )
+
+        try:
+            wrapper = ToolRegistry._build_mcp_callable(definition, services)
+            result = wrapper()
+        finally:
+            if os.path.exists(image_path):
+                os.remove(image_path)
+
+        self.assertEqual(len(result.content), 2)
+        self.assertEqual(result.content[0].type, "text")
+        self.assertEqual(result.content[1].type, "image")
+        self.assertEqual(result.content[1].mimeType, "image/png")
+        self.assertEqual(result.structuredContent["artifact_type"], "image")
 
 
 class RouteJsonSafetyTests(unittest.TestCase):
@@ -328,7 +395,286 @@ class ChatServiceTests(unittest.TestCase):
         self.assertIn("provider 'not-real'", response_payload["error"])
 
 
+class ViewToolTests(unittest.TestCase):
+    def test_export_active_view_image_posts_capture_payload(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "artifact_type": "image",
+                    "image_path": "C:\\captures\\active_view.png",
+                    "mime_type": "image/png",
+                }
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(capture_base_dir="C:\\captures"),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = export_active_view_image_handler(
+            services,
+            pixel_size=99999,
+            format="jpeg",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/views/active/export_image")
+        self.assertEqual(calls[0][1], "POST")
+        self.assertEqual(calls[0][2]["capture_dir"], "C:\\captures")
+        self.assertEqual(calls[0][2]["pixel_size"], 4096)
+        self.assertEqual(calls[0][2]["format"], "jpeg")
+
+    def test_activate_view_posts_activate_route_payload(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {"status": "success", "active_view": {"id": payload_data["view_id"], "name": "Level 1"}}
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = activate_view_handler(
+            services,
+            view_id="100",
+            view_name="Level",
+            exact_match=True,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/views/activate")
+        self.assertEqual(calls[0][1], "POST")
+        self.assertEqual(calls[0][2]["view_id"], "100")
+        self.assertEqual(calls[0][2]["view_name"], "Level")
+        self.assertTrue(calls[0][2]["exact_match"])
+
+    def test_activate_view_requires_view_identifier_before_route_call(self):
+        class FakeRevitClient:
+            def call_listener(self, *_args, **_kwargs):
+                raise AssertionError("route should not be called")
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = activate_view_handler(services)
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("view_id or view_name", result["message"])
+
+    def test_duplicate_view_posts_duplicate_route_payload(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {"status": "success", "new_view": {"id": "200", "name": payload_data["new_name"]}}
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = duplicate_view_handler(
+            services,
+            view_id="100",
+            duplicate_option="with_detailing",
+            new_name="L4 Demo Copy",
+            apply_template_id="300",
+            activate=True,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/views/duplicate")
+        self.assertEqual(calls[0][1], "POST")
+        self.assertEqual(calls[0][2]["view_id"], "100")
+        self.assertEqual(calls[0][2]["duplicate_option"], "with_detailing")
+        self.assertEqual(calls[0][2]["new_name"], "L4 Demo Copy")
+        self.assertEqual(calls[0][2]["apply_template_id"], "300")
+        self.assertTrue(calls[0][2]["activate"])
+
+    def test_duplicate_view_rejects_unknown_option_before_route_call(self):
+        class FakeRevitClient:
+            def call_listener(self, *_args, **_kwargs):
+                raise AssertionError("route should not be called")
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = duplicate_view_handler(services, duplicate_option="bad")
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("duplicate_option", result["message"])
+
+
 class ElementToolTests(unittest.TestCase):
+    def test_analyze_model_statistics_calls_model_route_with_bounds(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {"status": "success", "summary": {"total_elements": 12}}
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            result_store=SimpleNamespace(compact_result_payload=lambda result, preserve_keys=None: result),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = analyze_model_statistics_handler(services, top_n=999)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/model/statistics")
+        self.assertEqual(calls[0][1], "POST")
+        self.assertEqual(calls[0][2]["top_n"], 200)
+        self.assertTrue(calls[0][2]["include_detailed_types"])
+
+    def test_analyze_model_statistics_can_disable_detailed_types(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {"status": "success", "summary": {"total_elements": 12}}
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            result_store=SimpleNamespace(compact_result_payload=lambda result, preserve_keys=None: result),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = analyze_model_statistics_handler(services, include_detailed_types=False)
+
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(calls[0][2]["include_detailed_types"])
+
+    def test_override_element_graphics_resolves_result_handle(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {"status": "success", "applied_count": len(payload_data["element_ids"])}
+
+        class FakeResultStore:
+            def resolve_element_ids(self, element_ids=None, result_handle=None, category_name=None):
+                self.request = (element_ids, result_handle, category_name)
+                return ["101", "102"], {"result_handle": "res_source", "category": "Windows"}, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        result_store = FakeResultStore()
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            result_store=result_store,
+            revit_client=FakeRevitClient(),
+        )
+
+        result = override_element_graphics_handler(
+            services,
+            result_handle="res_source",
+            color={"r": 10, "g": 20, "b": 30},
+            transparency=45,
+            focus=True,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["source_result_handle"], "res_source")
+        self.assertEqual(calls[0][0], "/elements/override_graphics")
+        self.assertEqual(calls[0][2]["element_ids"], ["101", "102"])
+        self.assertEqual(calls[0][2]["color"], {"r": 10, "g": 20, "b": 30})
+        self.assertEqual(calls[0][2]["transparency"], 45)
+        self.assertTrue(calls[0][2]["focus"])
+
+    def test_delete_elements_defaults_to_dry_run_and_requires_route_payload(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {
+                    "status": "dry_run",
+                    "candidate_count": len(payload_data["element_ids"]),
+                    "dry_run": payload_data["dry_run"],
+                    "confirm_delete": payload_data["confirm_delete"],
+                    "unpin_before_delete": payload_data["unpin_before_delete"],
+                    "deletion_mode": payload_data["deletion_mode"],
+                }
+
+        class FakeResultStore:
+            def resolve_element_ids(self, element_ids=None, result_handle=None, category_name=None):
+                return [str(value) for value in range(1, 30)], None, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = delete_elements_handler(services, element_ids=["1"], max_count=999)
+
+        self.assertEqual(result["status"], "dry_run")
+        self.assertEqual(calls[0][0], "/elements/delete")
+        self.assertTrue(calls[0][2]["dry_run"])
+        self.assertFalse(calls[0][2]["confirm_delete"])
+        self.assertEqual(calls[0][2]["max_count"], 500)
+        self.assertFalse(calls[0][2]["unpin_before_delete"])
+        self.assertEqual(calls[0][2]["deletion_mode"], "individual")
+
+    def test_delete_elements_can_request_unpin_and_batch_mode(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "deleted_input_count": len(payload_data["element_ids"]),
+                    "unpin_before_delete": payload_data["unpin_before_delete"],
+                    "deletion_mode": payload_data["deletion_mode"],
+                }
+
+        class FakeResultStore:
+            def resolve_element_ids(self, element_ids=None, result_handle=None, category_name=None):
+                return ["501", "502"], {"result_handle": "res_panels", "category": "Curtain Panels"}, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = delete_elements_handler(
+            services,
+            result_handle="res_panels",
+            dry_run=False,
+            confirm_delete=True,
+            unpin_before_delete=True,
+            deletion_mode="batch",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(calls[0][2]["unpin_before_delete"])
+        self.assertEqual(calls[0][2]["deletion_mode"], "batch")
+
     def test_get_revit_diagnostics_calls_diagnostic_route_with_write_check(self):
         calls = []
 
@@ -609,6 +955,70 @@ class ElementToolTests(unittest.TestCase):
         self.assertEqual(property_reads[0][2]["element_ids"], [str(value) for value in range(1, 21)])
         self.assertEqual(property_reads[1][2]["element_ids"], [str(value) for value in range(21, 41)])
         self.assertEqual(property_reads[2][2]["element_ids"], [str(value) for value in range(41, 46)])
+
+    def test_get_element_properties_explicit_limit_returns_full_page_for_exports(self):
+        property_reads = []
+        compact_calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                property_reads.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "count": len(payload_data["element_ids"]),
+                    "elements": [
+                        {
+                            "element_id": element_id,
+                            "properties": {"Mark": "D-{}".format(element_id)},
+                            "typed_properties": {},
+                        }
+                        for element_id in payload_data["element_ids"]
+                    ],
+                }
+
+            def is_route_not_defined(self, *_args, **_kwargs):
+                return False
+
+        class FakeResultStore:
+            def resolve_element_ids(self, **_kwargs):
+                return [str(value) for value in range(1, 46)], {"storage_key": "doors"}, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                compact_calls.append(preserve_keys)
+                compact = dict(result)
+                if isinstance(compact.get("elements"), list) and len(compact["elements"]) > 20:
+                    compact["elements_sample"] = compact["elements"][:20]
+                    compact["elements_truncated"] = True
+                    compact["elements_total"] = len(compact["elements"])
+                    compact.pop("elements", None)
+                for key in preserve_keys or []:
+                    if key in result:
+                        compact[key] = result[key]
+                return compact
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(
+                max_elements_for_property_read=300,
+                max_records_in_response=20,
+            ),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = get_element_properties_handler(
+            services,
+            result_handle="res_doors",
+            parameter_names=["Mark"],
+            limit=45,
+        )
+
+        self.assertEqual(result["returned_count"], 45)
+        self.assertFalse(result["has_more"])
+        self.assertIn("elements", result)
+        self.assertEqual(len(result["elements"]), 45)
+        self.assertEqual(property_reads[0][2]["element_ids"], [str(value) for value in range(1, 46)])
+        self.assertEqual(compact_calls[0], ["elements"])
 
 
 class ContextToolMemoryTests(unittest.TestCase):
