@@ -896,8 +896,10 @@ def get_element_properties_handler(
 
     pageable_count = len(resolved_ids)
     page_offset = _bounded_int(offset, 0, min_value=0, max_value=pageable_count)
-    max_page_size = max(1, int(services.config.max_records_in_response))
-    default_page_size = min(max_page_size, pageable_count) if pageable_count else max_page_size
+    default_page_cap = max(1, int(services.config.max_records_in_response))
+    explicit_page_cap = max(1, int(services.config.max_elements_for_property_read))
+    max_page_size = explicit_page_cap if limit is not None else default_page_cap
+    default_page_size = min(default_page_cap, pageable_count) if pageable_count else default_page_cap
     page_limit = _bounded_int(limit, default_page_size, min_value=1, max_value=max_page_size)
     page_ids = resolved_ids[page_offset : page_offset + page_limit]
     next_offset = page_offset + len(page_ids)
@@ -974,7 +976,8 @@ def get_element_properties_handler(
             result["requested_count"] = requested_count
             result["truncated_for_safety"] = True
             result["safety_limit"] = services.config.max_elements_for_property_read
-    return services.result_store.compact_result_payload(result)
+    preserve_keys = ["elements"] if limit is not None else None
+    return services.result_store.compact_result_payload(result, preserve_keys=preserve_keys)
 
 
 def update_element_parameters_handler(
@@ -1257,7 +1260,11 @@ def build_element_tools() -> list[ToolDefinition]:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum elements to return for this page. Capped by the server response page size.",
+                        "description": (
+                            "Maximum elements to return for this page. Defaults to the compact response page size. "
+                            "For exports, schedules, or table creation, set this to the desired row count; explicit "
+                            "limits are capped by the property-read safety limit."
+                        ),
                     },
                 },
             },
