@@ -11,19 +11,24 @@ Repository layout note: this repository root is the pyRevit extension root. If y
 
 ## Tools
 
-RevitMCP exposes 22 tools:
+RevitMCP exposes 29 tools:
 
 | Tool | Description |
 | --- | --- |
 | `get_revit_project_info` | Get active project metadata, document path, and Revit version details |
 | `get_active_view_info` | Read the current view's name, type, scale, and related metadata |
 | `get_active_view_elements` | Capture a bounded snapshot of elements visible in the active view |
+| `export_active_view_image` | Export the active Revit view to a local image artifact for model vision inspection |
+| `activate_view` | Switch the active Revit view by view ID or view name |
+| `duplicate_view` | Duplicate a view, optionally with detailing/as dependent, template assignment, and activation |
 | `get_active_selection` | Read the current Revit selection as a reusable result set |
+| `get_revit_diagnostics` | Return live pyRevit route, document, active view, selection, and write-context diagnostics |
 | `list_family_types` | List loaded family types with category, family, type, and symbol IDs |
 | `get_revit_schema_context` | Load canonical Revit schema context including levels, categories, families, types, and common parameters |
 | `resolve_revit_targets` | Resolve user terms to exact Revit category, level, family, type, and parameter names |
 | `get_revit_memory_context` | Load persistent local user/project notes for recurring Revit conventions and workflow hints |
 | `save_revit_memory_note` | Save a persistent local user/project note for future chats and tool runs |
+| `analyze_model_statistics` | Summarize model composition including category, family/type, view, sheet, level, and room counts |
 | `get_elements_by_category` | Retrieve all elements for a category and store the result for follow-on actions |
 | `select_elements_by_id` | Select elements by explicit IDs or a stored result handle |
 | `select_stored_elements` | Select a previously stored search or filter result inside Revit |
@@ -32,6 +37,8 @@ RevitMCP exposes 22 tools:
 | `filter_stored_elements_by_parameter` | Refine a stored result set with batched server-side parameter filtering using one or many target values |
 | `get_element_properties` | Read parameter values for specific elements or an existing result handle |
 | `update_element_parameters` | Update one or many element parameters with typed value handling |
+| `override_element_graphics` | Apply or reset active-view graphic overrides for explicit IDs or stored result sets |
+| `delete_elements` | Delete elements with dry-run, confirmation, max-count, unpin, and batch/individual safeguards |
 | `place_view_on_sheet` | Create a new sheet, auto-number it, and place a matched view on it |
 | `list_views` | List views that can be placed on sheets, including type and placement status |
 | `analyze_view_naming_patterns` | Cluster view names by type and flag likely naming outliers |
