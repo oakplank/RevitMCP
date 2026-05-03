@@ -1,9 +1,13 @@
+import json
 import inspect
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from google.generativeai import types as google_types
+from mcp import types as mcp_types
+
+from RevitMCP_ExternalServer.core.image_artifacts import load_image_artifact
 
 
 @dataclass(frozen=True)
@@ -118,7 +122,22 @@ class ToolRegistry:
         required = set(definition.json_schema.get("required", []) or [])
 
         def wrapper(**kwargs):
-            return definition.handler(services, **kwargs)
+            result = definition.handler(services, **kwargs)
+            artifact = load_image_artifact(result, logger=services.logger)
+            if artifact:
+                return mcp_types.CallToolResult(
+                    content=[
+                        mcp_types.TextContent(type="text", text=json.dumps(result)),
+                        mcp_types.ImageContent(
+                            type="image",
+                            data=artifact["base64_data"],
+                            mimeType=artifact["mime_type"],
+                        ),
+                    ],
+                    structuredContent=result,
+                    isError=False,
+                )
+            return result
 
         wrapper.__name__ = definition.name
         wrapper.__doc__ = definition.description
@@ -146,14 +165,18 @@ class ToolRegistry:
 def build_tool_registry() -> ToolRegistry:
     from .context_tools import build_context_tools
     from .element_tools import build_element_tools
+    from .element_operation_tools import build_element_operation_tools
     from .memory_tools import build_memory_tools
+    from .model_tools import build_model_tools
     from .view_tools import build_view_tools
     from .planning_tools import build_planning_tools
 
     definitions = []
     definitions.extend(build_context_tools())
     definitions.extend(build_memory_tools())
+    definitions.extend(build_model_tools())
     definitions.extend(build_view_tools())
     definitions.extend(build_element_tools())
+    definitions.extend(build_element_operation_tools())
     definitions.extend(build_planning_tools())
     return ToolRegistry(definitions)
