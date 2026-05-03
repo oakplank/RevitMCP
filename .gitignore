@@ -45,3 +45,10 @@ build/
 
 # Local test scratch data
 lib/_tmp_testdata/
+
+# Local RevitMCP runtime artifacts
+.revitmcp_runtime/
+captures/
+
+# Local reference clones used during development
+references/

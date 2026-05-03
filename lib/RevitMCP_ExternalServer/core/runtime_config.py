@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 
 
 USER_DOCUMENTS = os.path.expanduser("~/Documents")
+EXTENSION_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir))
+RUNTIME_BASE_DIR = os.path.join(EXTENSION_ROOT, ".revitmcp_runtime")
+CAPTURE_BASE_DIR = os.path.join(RUNTIME_BASE_DIR, "captures")
 LOG_BASE_DIR = os.path.join(USER_DOCUMENTS, "RevitMCP", "server_logs")
 STARTUP_LOG_FILE = os.path.join(LOG_BASE_DIR, "server_startup_error.log")
 APP_LOG_FILE = os.path.join(LOG_BASE_DIR, "server_app.log")
@@ -14,6 +17,7 @@ DEFAULT_CORS_ORIGINS = ["http://localhost:8000", "http://127.0.0.1:8000"]
 DEFAULT_REVIT_PORTS = [48885, 48884, 48886]
 DEFAULT_DIRECT_REVIT_LISTENER_URL = "http://localhost:8001"
 FALLBACK_LOG_BASE_DIR = os.path.join(tempfile.gettempdir(), "RevitMCP", "server_logs")
+FALLBACK_CAPTURE_BASE_DIR = os.path.join(tempfile.gettempdir(), "RevitMCP", "captures")
 
 ANTHROPIC_MODEL_ID_MAP = {
     "claude-sonnet-4-6": "claude-sonnet-4-6",
@@ -34,6 +38,25 @@ def _ensure_log_dir() -> None:
             os.makedirs(LOG_BASE_DIR)
         STARTUP_LOG_FILE = os.path.join(LOG_BASE_DIR, os.path.basename(STARTUP_LOG_FILE))
         APP_LOG_FILE = os.path.join(LOG_BASE_DIR, os.path.basename(APP_LOG_FILE))
+
+
+def resolve_capture_base_dir(startup_logger=None) -> str:
+    requested_dir = os.environ.get("REVITMCP_CAPTURE_DIR", "").strip() or CAPTURE_BASE_DIR
+    try:
+        if not os.path.exists(requested_dir):
+            os.makedirs(requested_dir)
+        return requested_dir
+    except Exception as capture_dir_error:
+        if startup_logger:
+            startup_logger.warning(
+                "Could not use capture directory '%s': %s. Falling back to '%s'.",
+                requested_dir,
+                capture_dir_error,
+                FALLBACK_CAPTURE_BASE_DIR,
+            )
+        if not os.path.exists(FALLBACK_CAPTURE_BASE_DIR):
+            os.makedirs(FALLBACK_CAPTURE_BASE_DIR)
+        return FALLBACK_CAPTURE_BASE_DIR
 
 
 def _create_file_handler(log_path: str, mode: str = "a") -> tuple[logging.FileHandler, str]:
@@ -170,6 +193,7 @@ class RuntimeConfig:
     min_confidence_for_parameter_remap: float
     warm_schema_on_startup: bool
     max_tool_iterations: int
+    capture_base_dir: str
     revit_possible_ports: list[int] = field(default_factory=lambda: list(DEFAULT_REVIT_PORTS))
     direct_revit_listener_url: str = DEFAULT_DIRECT_REVIT_LISTENER_URL
     anthropic_model_id_map: dict[str, str] = field(default_factory=lambda: dict(ANTHROPIC_MODEL_ID_MAP))
@@ -202,6 +226,7 @@ def load_runtime_config() -> RuntimeConfig:
         warm_schema_on_startup=os.environ.get("REVITMCP_WARM_SCHEMA_ON_STARTUP", "true").strip().lower()
         in ("1", "true", "yes", "on"),
         max_tool_iterations=int(os.environ.get("REVITMCP_MAX_TOOL_ITERATIONS", "5")),
+        capture_base_dir=resolve_capture_base_dir(),
         revit_possible_ports=list(DEFAULT_REVIT_PORTS),
         direct_revit_listener_url=os.environ.get(
             "REVITMCP_DIRECT_LISTENER_URL",

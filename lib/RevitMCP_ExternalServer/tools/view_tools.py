@@ -8,7 +8,10 @@ from RevitMCP_ExternalServer.tools.registry import ToolDefinition
 
 GET_ACTIVE_VIEW_INFO_TOOL_NAME = "get_active_view_info"
 GET_ACTIVE_VIEW_ELEMENTS_TOOL_NAME = "get_active_view_elements"
+EXPORT_ACTIVE_VIEW_IMAGE_TOOL_NAME = "export_active_view_image"
 PLACE_VIEW_ON_SHEET_TOOL_NAME = "place_view_on_sheet"
+ACTIVATE_VIEW_TOOL_NAME = "activate_view"
+DUPLICATE_VIEW_TOOL_NAME = "duplicate_view"
 LIST_VIEWS_TOOL_NAME = "list_views"
 ANALYZE_VIEW_NAMING_PATTERNS_TOOL_NAME = "analyze_view_naming_patterns"
 SUGGEST_VIEW_NAME_CORRECTIONS_TOOL_NAME = "suggest_view_name_corrections"
@@ -139,6 +142,35 @@ def get_active_view_elements_handler(
     )
 
 
+def export_active_view_image_handler(
+    services,
+    pixel_size: int = 1600,
+    format: str = "png",
+    **_kwargs,
+) -> dict:
+    safe_pixel_size = bounded_int(pixel_size, 1600, min_value=256, max_value=4096)
+    normalized_format = str(format or "png").strip().lower()
+    if normalized_format not in ("png", "jpg", "jpeg", "bmp", "tif", "tiff"):
+        normalized_format = "png"
+
+    services.logger.info(
+        "MCP Tool executed: %s with pixel_size=%s format=%s",
+        EXPORT_ACTIVE_VIEW_IMAGE_TOOL_NAME,
+        safe_pixel_size,
+        normalized_format,
+    )
+
+    return services.revit_client.call_listener(
+        command_path="/views/active/export_image",
+        method="POST",
+        payload_data={
+            "capture_dir": services.config.capture_base_dir,
+            "pixel_size": safe_pixel_size,
+            "format": normalized_format,
+        },
+    )
+
+
 def place_view_on_sheet_handler(
     services,
     view_name: str = None,
@@ -181,6 +213,89 @@ def place_view_on_sheet_handler(
         payload["titleblock_name"] = titleblock_name
     return services.revit_client.call_listener(
         command_path="/sheets/place_view",
+        method="POST",
+        payload_data=payload,
+    )
+
+
+def activate_view_handler(
+    services,
+    view_id: str = None,
+    view_name: str = None,
+    exact_match: bool = False,
+    **_kwargs,
+) -> dict:
+    services.logger.info(
+        "MCP Tool executed: %s with view_id=%s, view_name=%s, exact_match=%s",
+        ACTIVATE_VIEW_TOOL_NAME,
+        view_id,
+        view_name,
+        exact_match,
+    )
+    if not view_id and not view_name:
+        return {
+            "status": "error",
+            "message": "Provide either view_id or view_name (use view_id when multiple views share a name).",
+        }
+
+    payload = {"exact_match": bool(exact_match)}
+    if view_id:
+        payload["view_id"] = str(view_id)
+    if view_name:
+        payload["view_name"] = view_name
+
+    return services.revit_client.call_listener(
+        command_path="/views/activate",
+        method="POST",
+        payload_data=payload,
+    )
+
+
+def duplicate_view_handler(
+    services,
+    view_id: str = None,
+    view_name: str = None,
+    duplicate_option: str = "duplicate",
+    new_name: str = None,
+    exact_match: bool = False,
+    uniquify_name: bool = True,
+    apply_template_id: str = None,
+    activate: bool = False,
+    **_kwargs,
+) -> dict:
+    normalized_option = str(duplicate_option or "duplicate").strip().lower()
+    if normalized_option not in ["duplicate", "with_detailing", "as_dependent"]:
+        return {
+            "status": "error",
+            "message": "duplicate_option must be one of: duplicate, with_detailing, as_dependent.",
+        }
+
+    payload = {
+        "duplicate_option": normalized_option,
+        "exact_match": bool(exact_match),
+        "uniquify_name": bool(uniquify_name),
+        "activate": bool(activate),
+    }
+    if view_id:
+        payload["view_id"] = str(view_id)
+    if view_name:
+        payload["view_name"] = view_name
+    if new_name:
+        payload["new_name"] = new_name
+    if apply_template_id:
+        payload["apply_template_id"] = str(apply_template_id)
+
+    services.logger.info(
+        "MCP Tool executed: %s with view_id=%s, view_name=%s, duplicate_option=%s, new_name=%s",
+        DUPLICATE_VIEW_TOOL_NAME,
+        view_id,
+        view_name,
+        normalized_option,
+        new_name,
+    )
+
+    return services.revit_client.call_listener(
+        command_path="/views/duplicate",
         method="POST",
         payload_data=payload,
     )
@@ -472,6 +587,28 @@ def build_view_tools() -> list[ToolDefinition]:
             handler=get_active_view_elements_handler,
         ),
         ToolDefinition(
+            name=EXPORT_ACTIVE_VIEW_IMAGE_TOOL_NAME,
+            description=(
+                "Exports the active Revit view to an image file in the local RevitMCP captures folder and returns "
+                "an image artifact path. Use activate_view first when a specific view should be inspected."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "pixel_size": {
+                        "type": "integer",
+                        "description": "Target export pixel size. Default 1600, min 256, max 4096.",
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
+                        "description": "Image format. Default png.",
+                    },
+                },
+            },
+            handler=export_active_view_image_handler,
+        ),
+        ToolDefinition(
             name=PLACE_VIEW_ON_SHEET_TOOL_NAME,
             description=(
                 "Places a view on a sheet. Two modes: (1) creates a NEW sheet (default — pass titleblock_id or "
@@ -534,6 +671,79 @@ def build_view_tools() -> list[ToolDefinition]:
                 },
             },
             handler=place_view_on_sheet_handler,
+        ),
+        ToolDefinition(
+            name=ACTIVATE_VIEW_TOOL_NAME,
+            description=(
+                "Switches the active Revit view. Identify the target by view_id (preferred) or view_name with "
+                "optional exact matching. Use list_views first to discover view IDs, then get_active_view_elements "
+                "to inspect what is visible after navigation."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "view_id": {
+                        "type": "string",
+                        "description": "Element ID of the view to activate. Preferred when names are ambiguous.",
+                    },
+                    "view_name": {
+                        "type": "string",
+                        "description": "Name or partial name of the view to activate. Ignored if view_id resolves.",
+                    },
+                    "exact_match": {
+                        "type": "boolean",
+                        "description": "Whether view_name must match exactly. Default false.",
+                    },
+                },
+            },
+            handler=activate_view_handler,
+        ),
+        ToolDefinition(
+            name=DUPLICATE_VIEW_TOOL_NAME,
+            description=(
+                "Duplicates a Revit view. Identify the source by view_id, view_name, or omit both to duplicate the "
+                "active view. Supports duplicate, with_detailing, and as_dependent modes, optional new_name, optional "
+                "view template assignment, and optional activation of the new view."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "view_id": {
+                        "type": "string",
+                        "description": "Element ID of the source view. Preferred when names are ambiguous.",
+                    },
+                    "view_name": {
+                        "type": "string",
+                        "description": "Name or partial name of the source view. Ignored if view_id is supplied.",
+                    },
+                    "duplicate_option": {
+                        "type": "string",
+                        "enum": ["duplicate", "with_detailing", "as_dependent"],
+                        "description": "How to duplicate the view. Default duplicate.",
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": "Optional name for the duplicated view.",
+                    },
+                    "exact_match": {
+                        "type": "boolean",
+                        "description": "Whether view_name must match exactly. Default false.",
+                    },
+                    "uniquify_name": {
+                        "type": "boolean",
+                        "description": "When true, appends a number if new_name already exists. Default true.",
+                    },
+                    "apply_template_id": {
+                        "type": "string",
+                        "description": "Optional view template Element ID to assign to the duplicated view.",
+                    },
+                    "activate": {
+                        "type": "boolean",
+                        "description": "When true, makes the duplicated view active after creation. Default false.",
+                    },
+                },
+            },
+            handler=duplicate_view_handler,
         ),
         ToolDefinition(
             name=LIST_VIEWS_TOOL_NAME,
