@@ -402,6 +402,18 @@ def _coerce_bool(value, default=False):
     return default
 
 
+def _bounded_int(value, default, min_value=None, max_value=None):
+    try:
+        number = int(value)
+    except Exception:
+        number = default
+    if min_value is not None:
+        number = max(min_value, number)
+    if max_value is not None:
+        number = min(max_value, number)
+    return number
+
+
 def _get_revit_process_info():
     info = {"pid": None, "process_name": None}
     try:
@@ -1030,6 +1042,264 @@ def _build_element_summary(element, doc):
     return summary
 
 
+def _safe_element_id_text(element_id):
+    if not element_id:
+        return None
+    try:
+        if element_id == DB.ElementId.InvalidElementId:
+            return None
+    except Exception:
+        pass
+    try:
+        return str(element_id.IntegerValue)
+    except Exception:
+        try:
+            return str(element_id.Value)
+        except Exception:
+            return str(element_id)
+
+
+def _safe_xyz_summary(xyz):
+    if not xyz:
+        return None
+    try:
+        return {
+            "x": float(xyz.X),
+            "y": float(xyz.Y),
+            "z": float(xyz.Z),
+        }
+    except Exception:
+        return None
+
+
+def _element_ref_summary(element, doc, relationship=None):
+    if not element:
+        return None
+    summary = _build_element_summary(element, doc)
+    try:
+        type_id = element.GetTypeId()
+        type_id_text = _safe_element_id_text(type_id)
+        if type_id_text:
+            summary["type_id"] = type_id_text
+    except Exception:
+        pass
+    try:
+        owner_view_id = getattr(element, "OwnerViewId", None)
+        owner_view_id_text = _safe_element_id_text(owner_view_id)
+        if owner_view_id_text:
+            summary["owner_view_id"] = owner_view_id_text
+    except Exception:
+        pass
+    if relationship:
+        summary["relationship"] = relationship
+    return summary
+
+
+def _element_ids_to_summaries(doc, element_ids, relationship, limit):
+    summaries = []
+    total = 0
+    try:
+        total = int(element_ids.Count)
+    except Exception:
+        try:
+            total = len(list(element_ids))
+        except Exception:
+            total = 0
+
+    for element_id in element_ids:
+        if len(summaries) >= limit:
+            break
+        try:
+            element = doc.GetElement(element_id)
+            if element:
+                summary = _element_ref_summary(element, doc, relationship=relationship)
+                if summary:
+                    summaries.append(summary)
+        except Exception:
+            continue
+
+    return {
+        "total_count": total,
+        "returned_count": len(summaries),
+        "truncated": total > len(summaries),
+        "elements": summaries,
+    }
+
+
+def _get_direct_host(element):
+    try:
+        host = getattr(element, "Host", None)
+        if host:
+            return host
+    except Exception:
+        pass
+    return None
+
+
+def _get_super_component(element):
+    try:
+        super_component = getattr(element, "SuperComponent", None)
+        if super_component:
+            return super_component
+    except Exception:
+        pass
+    return None
+
+
+def _next_parent_relationship(element):
+    host = _get_direct_host(element)
+    if host:
+        return host, "host"
+    super_component = _get_super_component(element)
+    if super_component:
+        return super_component, "super_component"
+    return None, None
+
+
+def _build_host_chain(element, doc, max_depth):
+    chain = []
+    visited = set()
+    current = element
+
+    for _index in range(max_depth):
+        parent, relationship = _next_parent_relationship(current)
+        if not parent:
+            break
+        parent_id = _safe_element_id_text(parent.Id)
+        if not parent_id or parent_id in visited:
+            break
+        visited.add(parent_id)
+        summary = _element_ref_summary(parent, doc, relationship=relationship)
+        if summary:
+            chain.append(summary)
+        current = parent
+
+    return chain
+
+
+def _adaptive_placement_points(element, doc):
+    points = []
+    utils = getattr(DB, "AdaptiveComponentInstanceUtils", None)
+    if not utils:
+        return points
+
+    try:
+        point_ids = utils.GetInstancePlacementPointElementRefIds(element)
+    except Exception:
+        return points
+
+    for index, point_id in enumerate(point_ids):
+        point_summary = {
+            "index": index,
+            "point_element_id": _safe_element_id_text(point_id),
+            "position": None,
+        }
+        try:
+            point = doc.GetElement(point_id)
+            if point:
+                point_summary["point"] = _element_ref_summary(point, doc, relationship="adaptive_placement_point")
+                position = getattr(point, "Position", None)
+                point_summary["position"] = _safe_xyz_summary(position)
+        except Exception:
+            pass
+        points.append(point_summary)
+
+    return points
+
+
+def _relationship_record_for_element(
+    element,
+    doc,
+    include_host_chain=True,
+    include_children=True,
+    include_dependents=False,
+    include_adaptive_points=True,
+    max_depth=3,
+    max_children=100,
+):
+    record = {
+        "element": _element_ref_summary(element, doc),
+        "host": None,
+        "super_component": None,
+        "host_chain": [],
+        "sub_components": {"total_count": 0, "returned_count": 0, "truncated": False, "elements": []},
+        "hosted_inserts": {"total_count": 0, "returned_count": 0, "truncated": False, "elements": []},
+        "dependents": {"total_count": 0, "returned_count": 0, "truncated": False, "elements": []},
+        "adaptive_placement_points": [],
+    }
+
+    host = _get_direct_host(element)
+    if host:
+        record["host"] = _element_ref_summary(host, doc, relationship="host")
+
+    super_component = _get_super_component(element)
+    if super_component:
+        record["super_component"] = _element_ref_summary(super_component, doc, relationship="super_component")
+
+    try:
+        group_id_text = _safe_element_id_text(getattr(element, "GroupId", None))
+        if group_id_text:
+            group = doc.GetElement(element.GroupId)
+            if group:
+                record["group"] = _element_ref_summary(group, doc, relationship="group")
+    except Exception:
+        pass
+
+    try:
+        assembly_id_text = _safe_element_id_text(getattr(element, "AssemblyInstanceId", None))
+        if assembly_id_text:
+            assembly = doc.GetElement(element.AssemblyInstanceId)
+            if assembly:
+                record["assembly"] = _element_ref_summary(assembly, doc, relationship="assembly")
+    except Exception:
+        pass
+
+    if include_host_chain:
+        record["host_chain"] = _build_host_chain(element, doc, max_depth=max_depth)
+
+    if include_adaptive_points:
+        record["adaptive_placement_points"] = _adaptive_placement_points(element, doc)
+
+    if include_children:
+        try:
+            sub_component_ids = element.GetSubComponentIds()
+            record["sub_components"] = _element_ids_to_summaries(
+                doc,
+                sub_component_ids,
+                relationship="sub_component",
+                limit=max_children,
+            )
+        except Exception:
+            pass
+
+        try:
+            find_inserts = getattr(element, "FindInserts", None)
+            if find_inserts:
+                insert_ids = find_inserts(True, True, True, True)
+                record["hosted_inserts"] = _element_ids_to_summaries(
+                    doc,
+                    insert_ids,
+                    relationship="hosted_insert",
+                    limit=max_children,
+                )
+        except Exception:
+            pass
+
+    if include_dependents:
+        try:
+            dependent_ids = element.GetDependentElements(None)
+            record["dependents"] = _element_ids_to_summaries(
+                doc,
+                dependent_ids,
+                relationship="dependent",
+                limit=max_children,
+            )
+        except Exception:
+            pass
+
+    return record
+
+
 def register_routes(api):
     """Register all element-related routes with the API"""
 
@@ -1588,16 +1858,113 @@ def register_routes(api):
                     route_logger.warning("Error processing element {}: {}".format(id_str, elem_error))
                     results.append({"element_id": id_str, "error": str(elem_error), "properties": {}, "typed_properties": {}})
 
-            return {
+            return sanitize_for_json({
                 "status": "success",
                 "message": "Retrieved properties for {} elements".format(len(results)),
                 "count": len(results),
                 "elements": results
-            }
+            })
 
         except Exception as e:
             route_logger.error("Error in /elements/get_properties: {}".format(e), exc_info=True)
             return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/elements/relationships', methods=['POST'])
+    def handle_get_element_relationships(doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            if not payload or not isinstance(payload, dict):
+                return routes.Response(status=400, data={"status": "error", "error": "Invalid JSON payload"})
+
+            element_ids_list = payload.get('element_ids')
+            if not element_ids_list:
+                return routes.Response(status=400, data={"status": "error", "error": "Missing 'element_ids'"})
+
+            include_host_chain = _coerce_bool(payload.get("include_host_chain"), default=True)
+            include_children = _coerce_bool(payload.get("include_children"), default=True)
+            include_dependents = _coerce_bool(payload.get("include_dependents"), default=False)
+            include_adaptive_points = _coerce_bool(payload.get("include_adaptive_points"), default=True)
+            max_depth = _bounded_int(payload.get("max_depth"), 3, min_value=1, max_value=20)
+            max_children = _bounded_int(payload.get("max_children"), 100, min_value=0, max_value=1000)
+
+            results = []
+            missing_ids = []
+            invalid_ids = []
+
+            for id_value in element_ids_list:
+                id_text = str(id_value).strip()
+                try:
+                    element_id = DB.ElementId(int(id_text))
+                except Exception:
+                    invalid_ids.append(id_text)
+                    results.append({
+                        "element_id": id_text,
+                        "status": "error",
+                        "error": "Invalid element id.",
+                    })
+                    continue
+
+                try:
+                    element = doc.GetElement(element_id)
+                    if not element:
+                        missing_ids.append(id_text)
+                        results.append({
+                            "element_id": id_text,
+                            "status": "error",
+                            "error": "Element not found.",
+                        })
+                        continue
+
+                    record = _relationship_record_for_element(
+                        element,
+                        doc,
+                        include_host_chain=include_host_chain,
+                        include_children=include_children,
+                        include_dependents=include_dependents,
+                        include_adaptive_points=include_adaptive_points,
+                        max_depth=max_depth,
+                        max_children=max_children,
+                    )
+                    record["element_id"] = id_text
+                    record["status"] = "success"
+                    results.append(record)
+                except Exception as elem_error:
+                    route_logger.warning("Error reading relationships for element {}: {}".format(id_text, elem_error))
+                    results.append({
+                        "element_id": id_text,
+                        "status": "error",
+                        "error": str(elem_error),
+                    })
+
+            return sanitize_for_json({
+                "status": "success",
+                "message": "Retrieved relationships for {} requested elements.".format(len(element_ids_list)),
+                "count": len(results),
+                "relationships": results,
+                "missing_ids": missing_ids,
+                "invalid_ids": invalid_ids,
+                "options": {
+                    "include_host_chain": include_host_chain,
+                    "include_children": include_children,
+                    "include_dependents": include_dependents,
+                    "include_adaptive_points": include_adaptive_points,
+                    "max_depth": max_depth,
+                    "max_children": max_children,
+                },
+            })
+
+        except Exception as e:
+            route_logger.error("Error in /elements/relationships: {}".format(e), exc_info=True)
+            return routes.Response(
+                status=500,
+                data=sanitize_for_json({
+                    "status": "error",
+                    "error": "Internal server error while reading element relationships.",
+                    "details": str(e),
+                }),
+            )
 
     @api.route('/elements/update_parameters', methods=['POST'])
     def handle_update_element_parameters(uidoc, doc, request):

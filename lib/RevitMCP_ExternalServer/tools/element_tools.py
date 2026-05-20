@@ -13,6 +13,8 @@ LIST_STORED_ELEMENTS_TOOL_NAME = "list_stored_elements"
 FILTER_ELEMENTS_TOOL_NAME = "filter_elements"
 FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME = "filter_stored_elements_by_parameter"
 GET_ELEMENT_PROPERTIES_TOOL_NAME = "get_element_properties"
+GET_ELEMENT_RELATIONSHIPS_TOOL_NAME = "get_element_relationships"
+GET_RELATED_ELEMENT_PROPERTIES_TOOL_NAME = "get_related_element_properties"
 UPDATE_ELEMENT_PARAMETERS_TOOL_NAME = "update_element_parameters"
 
 FILTER_STRING_OPERATORS = ["contains", "equals", "not_equals", "starts_with", "ends_with"]
@@ -883,17 +885,6 @@ def get_element_properties_handler(
 
     requested_count = len(resolved_ids)
     source_count = requested_count
-    truncated_for_safety = False
-    if requested_count > services.config.max_elements_for_property_read:
-        resolved_ids = resolved_ids[: services.config.max_elements_for_property_read]
-        truncated_for_safety = True
-        services.logger.warning(
-            "%s requested %s elements; limiting property read to first %s for safety",
-            GET_ELEMENT_PROPERTIES_TOOL_NAME,
-            requested_count,
-            services.config.max_elements_for_property_read,
-        )
-
     pageable_count = len(resolved_ids)
     page_offset = _bounded_int(offset, 0, min_value=0, max_value=pageable_count)
     default_page_cap = max(1, int(services.config.max_records_in_response))
@@ -929,9 +920,6 @@ def get_element_properties_handler(
         }
         if result_handle:
             result["result_handle"] = result_handle
-        if truncated_for_safety:
-            result["truncated_for_safety"] = True
-            result["safety_limit"] = services.config.max_elements_for_property_read
         return result
 
     payload = {"element_ids": page_ids}
@@ -972,11 +960,356 @@ def get_element_properties_handler(
         )
         if has_more:
             result["message"] += " Call again with offset={} for the next page.".format(next_offset)
-        if truncated_for_safety:
-            result["requested_count"] = requested_count
-            result["truncated_for_safety"] = True
-            result["safety_limit"] = services.config.max_elements_for_property_read
     preserve_keys = ["elements"] if limit is not None else None
+    return services.result_store.compact_result_payload(result, preserve_keys=preserve_keys)
+
+
+def get_element_relationships_handler(
+    services,
+    element_ids: list[str] = None,
+    result_handle: str = None,
+    include_host_chain: bool = True,
+    include_children: bool = True,
+    include_dependents: bool = False,
+    include_adaptive_points: bool = True,
+    max_depth: int = 3,
+    max_children: int = 100,
+    offset: int = 0,
+    limit: int = None,
+    **_kwargs,
+) -> dict:
+    resolved_ids, _record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=element_ids,
+        result_handle=result_handle,
+    )
+    if resolve_error:
+        return resolve_error
+
+    requested_count = len(resolved_ids)
+    page_offset = _bounded_int(offset, 0, min_value=0, max_value=requested_count)
+    default_page_cap = max(1, int(services.config.max_records_in_response))
+    explicit_page_cap = max(1, int(services.config.max_elements_for_property_read))
+    max_page_size = explicit_page_cap if limit is not None else default_page_cap
+    default_page_size = min(default_page_cap, requested_count) if requested_count else default_page_cap
+    page_limit = _bounded_int(limit, default_page_size, min_value=1, max_value=max_page_size)
+    page_ids = resolved_ids[page_offset : page_offset + page_limit]
+    next_offset = page_offset + len(page_ids)
+    has_more = next_offset < requested_count
+
+    safe_max_depth = _bounded_int(max_depth, 3, min_value=1, max_value=20)
+    safe_max_children = _bounded_int(max_children, 100, min_value=0, max_value=1000)
+    services.logger.info(
+        "MCP Tool executed: %s with %s source elements, page offset=%s limit=%s",
+        GET_ELEMENT_RELATIONSHIPS_TOOL_NAME,
+        requested_count,
+        page_offset,
+        page_limit,
+    )
+
+    if not page_ids:
+        return {
+            "status": "success",
+            "message": "Retrieved relationships for 0 elements.",
+            "count": 0,
+            "relationships": [],
+            "source_count": requested_count,
+            "page_offset": page_offset,
+            "page_limit": page_limit,
+            "returned_count": 0,
+            "has_more": False,
+            "next_offset": None,
+        }
+
+    result = services.revit_client.call_listener(
+        command_path="/elements/relationships",
+        method="POST",
+        payload_data={
+            "element_ids": page_ids,
+            "include_host_chain": bool(include_host_chain),
+            "include_children": bool(include_children),
+            "include_dependents": bool(include_dependents),
+            "include_adaptive_points": bool(include_adaptive_points),
+            "max_depth": safe_max_depth,
+            "max_children": safe_max_children,
+        },
+    )
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/relationships"):
+        return {
+            "status": "error",
+            "error_type": "route_not_defined",
+            "message": "The active Revit route set does not support '/elements/relationships'. Reload/update the Revit extension to enable relationship reads.",
+        }
+    if result.get("status") == "success":
+        relationships = result.get("relationships", []) or []
+        result["source_count"] = requested_count
+        result["page_offset"] = page_offset
+        result["page_limit"] = page_limit
+        result["returned_count"] = len(relationships)
+        result["has_more"] = has_more
+        result["next_offset"] = next_offset if has_more else None
+        result["message"] = "Retrieved relationships for {} of {} elements (offset {}, limit {}).".format(
+            len(relationships),
+            requested_count,
+            page_offset,
+            page_limit,
+        )
+        if has_more:
+            result["message"] += " Call again with offset={} for the next page.".format(next_offset)
+    preserve_keys = ["relationships"] if limit is not None else None
+    return services.result_store.compact_result_payload(result, preserve_keys=preserve_keys)
+
+
+def _normalize_parameter_names(value):
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    names = []
+    seen = set()
+    for item in value:
+        name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _relationship_ref_element_id(ref):
+    if not isinstance(ref, dict):
+        return None
+    element_id = ref.get("element_id") or ref.get("id")
+    if element_id is None:
+        return None
+    element_id = str(element_id).strip()
+    return element_id or None
+
+
+def _property_records_by_id(property_result):
+    records = {}
+    for item in property_result.get("elements", []) or []:
+        element_id = str(item.get("element_id", "")).strip()
+        if element_id:
+            records[element_id] = item
+    return records
+
+
+def _collect_related_ids(relationship, include_host=True, include_super_component=True, include_host_chain=True):
+    ids = []
+    seen = set()
+
+    def add_ref(ref):
+        element_id = _relationship_ref_element_id(ref)
+        if element_id and element_id not in seen:
+            seen.add(element_id)
+            ids.append(element_id)
+
+    if include_host:
+        add_ref(relationship.get("host"))
+    if include_super_component:
+        add_ref(relationship.get("super_component"))
+    if include_host_chain:
+        for chain_ref in relationship.get("host_chain", []) or []:
+            add_ref(chain_ref)
+
+    return ids
+
+
+def _enrich_relationship_ref(ref, property_records):
+    if not ref:
+        return None
+    element_id = _relationship_ref_element_id(ref)
+    property_record = property_records.get(element_id, {}) if element_id else {}
+    enriched = {
+        "element": ref,
+        "properties": property_record.get("properties", {}),
+        "typed_properties": property_record.get("typed_properties", {}),
+    }
+    if property_record.get("error"):
+        enriched["error"] = property_record.get("error")
+    return enriched
+
+
+def _read_element_properties_for_ids(services, element_ids, parameter_names):
+    if not element_ids:
+        return {"status": "success", "elements": []}
+    payload = {"element_ids": element_ids}
+    if parameter_names:
+        payload["parameter_names"] = parameter_names
+    result = services.revit_client.call_listener(
+        command_path="/elements/get_properties",
+        method="POST",
+        payload_data=payload,
+    )
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/get_properties"):
+        return {
+            "status": "error",
+            "error_type": "route_not_defined",
+            "message": "The active Revit route set does not support '/elements/get_properties'. Reload/update the Revit extension to enable property reads.",
+        }
+    return result
+
+
+def get_related_element_properties_handler(
+    services,
+    element_ids: list[str] = None,
+    result_handle: str = None,
+    parameter_names: list[str] = None,
+    source_parameter_names: list[str] = None,
+    related_parameter_names: list[str] = None,
+    include_host: bool = True,
+    include_super_component: bool = True,
+    include_host_chain: bool = True,
+    max_depth: int = 3,
+    offset: int = 0,
+    limit: int = None,
+    **_kwargs,
+) -> dict:
+    resolved_ids, _record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=element_ids,
+        result_handle=result_handle,
+    )
+    if resolve_error:
+        return resolve_error
+
+    requested_count = len(resolved_ids)
+    page_offset = _bounded_int(offset, 0, min_value=0, max_value=requested_count)
+    default_page_cap = max(1, int(services.config.max_records_in_response))
+    explicit_page_cap = max(1, int(services.config.max_elements_for_property_read))
+    max_page_size = explicit_page_cap if limit is not None else default_page_cap
+    default_page_size = min(default_page_cap, requested_count) if requested_count else default_page_cap
+    page_limit = _bounded_int(limit, default_page_size, min_value=1, max_value=max_page_size)
+    page_ids = resolved_ids[page_offset : page_offset + page_limit]
+    next_offset = page_offset + len(page_ids)
+    has_more = next_offset < requested_count
+
+    source_names = _normalize_parameter_names(source_parameter_names) or _normalize_parameter_names(parameter_names)
+    related_names = _normalize_parameter_names(related_parameter_names) or _normalize_parameter_names(parameter_names)
+    safe_max_depth = _bounded_int(max_depth, 3, min_value=1, max_value=20)
+
+    services.logger.info(
+        "MCP Tool executed: %s with %s source elements, page offset=%s limit=%s",
+        GET_RELATED_ELEMENT_PROPERTIES_TOOL_NAME,
+        requested_count,
+        page_offset,
+        page_limit,
+    )
+
+    if not page_ids:
+        return {
+            "status": "success",
+            "message": "Retrieved related properties for 0 elements.",
+            "count": 0,
+            "items": [],
+            "source_count": requested_count,
+            "page_offset": page_offset,
+            "page_limit": page_limit,
+            "returned_count": 0,
+            "has_more": False,
+            "next_offset": None,
+        }
+
+    relationship_result = services.revit_client.call_listener(
+        command_path="/elements/relationships",
+        method="POST",
+        payload_data={
+            "element_ids": page_ids,
+            "include_host_chain": bool(include_host_chain),
+            "include_children": False,
+            "include_dependents": False,
+            "include_adaptive_points": False,
+            "max_depth": safe_max_depth,
+            "max_children": 0,
+        },
+    )
+    if relationship_result.get("status") == "error":
+        if services.revit_client.is_route_not_defined(relationship_result, "/elements/relationships"):
+            return {
+                "status": "error",
+                "error_type": "route_not_defined",
+                "message": "The active Revit route set does not support '/elements/relationships'. Reload/update the Revit extension to enable related property reads.",
+            }
+        return relationship_result
+
+    relationships = relationship_result.get("relationships", []) or []
+    related_ids = []
+    related_seen = set()
+    for relationship in relationships:
+        for related_id in _collect_related_ids(
+            relationship,
+            include_host=bool(include_host),
+            include_super_component=bool(include_super_component),
+            include_host_chain=bool(include_host_chain),
+        ):
+            if related_id not in related_seen:
+                related_seen.add(related_id)
+                related_ids.append(related_id)
+
+    source_property_result = _read_element_properties_for_ids(services, page_ids, source_names)
+    if source_property_result.get("status") == "error":
+        return source_property_result
+
+    related_property_result = _read_element_properties_for_ids(services, related_ids, related_names)
+    if related_property_result.get("status") == "error":
+        return related_property_result
+
+    source_property_records = _property_records_by_id(source_property_result)
+    related_property_records = _property_records_by_id(related_property_result)
+
+    items = []
+    for relationship in relationships:
+        source_id = str(relationship.get("element_id", "")).strip()
+        source_record = source_property_records.get(source_id, {})
+        item = {
+            "element_id": source_id,
+            "status": relationship.get("status", "success"),
+            "element": relationship.get("element"),
+            "source_properties": source_record.get("properties", {}),
+            "source_typed_properties": source_record.get("typed_properties", {}),
+            "host": _enrich_relationship_ref(relationship.get("host"), related_property_records),
+            "super_component": _enrich_relationship_ref(relationship.get("super_component"), related_property_records),
+            "host_chain": [
+                _enrich_relationship_ref(chain_ref, related_property_records)
+                for chain_ref in relationship.get("host_chain", []) or []
+                if chain_ref
+            ],
+        }
+        if source_record.get("error"):
+            item["source_error"] = source_record.get("error")
+        if relationship.get("error"):
+            item["relationship_error"] = relationship.get("error")
+        items.append(item)
+
+    result = {
+        "status": "success",
+        "message": "Retrieved related properties for {} of {} elements (offset {}, limit {}).".format(
+            len(items),
+            requested_count,
+            page_offset,
+            page_limit,
+        ),
+        "count": len(items),
+        "items": items,
+        "source_count": requested_count,
+        "page_offset": page_offset,
+        "page_limit": page_limit,
+        "returned_count": len(items),
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
+        "related_element_ids": related_ids,
+        "options": {
+            "include_host": bool(include_host),
+            "include_super_component": bool(include_super_component),
+            "include_host_chain": bool(include_host_chain),
+            "max_depth": safe_max_depth,
+            "source_parameter_names": source_names,
+            "related_parameter_names": related_names,
+        },
+    }
+    if has_more:
+        result["message"] += " Call again with offset={} for the next page.".format(next_offset)
+
+    preserve_keys = ["items"] if limit is not None else None
     return services.result_store.compact_result_payload(result, preserve_keys=preserve_keys)
 
 
@@ -1269,6 +1602,110 @@ def build_element_tools() -> list[ToolDefinition]:
                 },
             },
             handler=get_element_properties_handler,
+        ),
+        ToolDefinition(
+            name=GET_ELEMENT_RELATIONSHIPS_TOOL_NAME,
+            description=(
+                "Gets host/parent/child relationships for Revit elements. Use this to walk from hosted windows "
+                "to adaptive curtain panel parents, inspect host chains, retrieve nested subcomponents, hosted "
+                "inserts, optional dependents, and adaptive placement points. Results are paged; use offset and "
+                "limit when has_more is true."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "include_host_chain": {
+                        "type": "boolean",
+                        "description": "When true, walks Host/SuperComponent parent links up to max_depth. Default true.",
+                    },
+                    "include_children": {
+                        "type": "boolean",
+                        "description": "When true, includes subcomponents and hosted inserts where Revit exposes them. Default true.",
+                    },
+                    "include_dependents": {
+                        "type": "boolean",
+                        "description": "When true, includes dependent elements. Can be noisy. Default false.",
+                    },
+                    "include_adaptive_points": {
+                        "type": "boolean",
+                        "description": "When true, includes adaptive component placement points when available. Default true.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Maximum host-chain depth. Default 3, max 20.",
+                    },
+                    "max_children": {
+                        "type": "integer",
+                        "description": "Maximum subcomponents/inserts/dependents returned per source element. Default 100, max 1000.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based page offset into the resolved element list.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum source elements to process on this page.",
+                    },
+                },
+            },
+            handler=get_element_relationships_handler,
+        ),
+        ToolDefinition(
+            name=GET_RELATED_ELEMENT_PROPERTIES_TOOL_NAME,
+            description=(
+                "Resolves each source element's host/super-component/host-chain parents and reads selected "
+                "parameters from the source and related elements in one read-only call. Useful for QA checks like "
+                "hosted window parameters versus parent curtain panel geometry/settings."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "parameter_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Parameter names to read from both source and related elements unless source/related-specific lists are supplied.",
+                    },
+                    "source_parameter_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Parameter names to read from the original source elements.",
+                    },
+                    "related_parameter_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Parameter names to read from host, super-component, and host-chain elements.",
+                    },
+                    "include_host": {
+                        "type": "boolean",
+                        "description": "When true, includes direct Host properties when Revit exposes a host. Default true.",
+                    },
+                    "include_super_component": {
+                        "type": "boolean",
+                        "description": "When true, includes immediate SuperComponent properties. Default true.",
+                    },
+                    "include_host_chain": {
+                        "type": "boolean",
+                        "description": "When true, includes parent-chain properties up to max_depth. Default true.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Maximum host-chain depth. Default 3, max 20.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based page offset into the resolved source element list.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum source elements to process on this page.",
+                    },
+                },
+            },
+            handler=get_related_element_properties_handler,
         ),
         ToolDefinition(
             name=UPDATE_ELEMENT_PARAMETERS_TOOL_NAME,
