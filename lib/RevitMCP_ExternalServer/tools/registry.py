@@ -170,12 +170,14 @@ def build_tool_registry() -> ToolRegistry:
     from .model_tools import build_model_tools
     from .view_tools import build_view_tools
     from .planning_tools import build_planning_tools
+    from .schedule_tools import build_schedule_tools
 
     definitions = []
     definitions.extend(build_context_tools())
     definitions.extend(build_memory_tools())
     definitions.extend(build_model_tools())
     definitions.extend(build_view_tools())
+    definitions.extend(build_schedule_tools())
     definitions.extend(build_element_tools())
     definitions.extend(build_element_operation_tools())
     definitions.extend(build_planning_tools())
