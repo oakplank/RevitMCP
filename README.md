@@ -49,7 +49,7 @@ RevitMCP exposes 29 tools:
 
 *   Autodesk Revit
 *   pyRevit
-*   Python 3.7+ available as `python` if you want to run the external server directly or through Claude Desktop
+*   Python 3.7+ available as `python` if you want to run the external server directly or through Claude Desktop. Python 3.13 or older is recommended because some current AI-provider dependencies warn under Python 3.14+.
 *   A Revit project open while using RevitMCP
 
 ## Surface Modes
@@ -117,7 +117,53 @@ The default Revit Routes port is usually `48884`.
 4.  Add any required model or API settings in the web UI.
 5.  Try: `Get Revit project info`
 
+## Share the Web UI on Your LAN
+
+By default, the Web UI listens on `127.0.0.1`. That only works on the same computer, so a coworker on another machine cannot connect to `http://127.0.0.1:8000`.
+
+To allow another computer on the same trusted network:
+
+1.  On the Revit computer, edit:
+
+```powershell
+%USERPROFILE%\Documents\RevitMCP\user_data\revitmcp_settings.json
+```
+
+2.  Under `servers`, set:
+
+```json
+{
+  "servers": {
+    "external_server_host": "0.0.0.0",
+    "external_server_port": 8000
+  }
+}
+```
+
+Keep the rest of the settings file intact.
+
+3.  Restart the RevitMCP server.
+4.  Find the Revit computer's LAN IP:
+
+```powershell
+ipconfig
+```
+
+Use the `IPv4 Address` for the active Wi-Fi or Ethernet adapter.
+
+5.  From the coworker's computer, open:
+
+```text
+http://<REVIT_COMPUTER_IPV4>:8000
+```
+
+If the page still does not load, allow `python.exe` through Windows Defender Firewall on private networks, or add an inbound TCP rule for port `8000`.
+
+Do not expose this server on public networks or the open internet. The Web UI is intended for trusted local use.
+
 ## Quick Start: Claude Desktop
+
+Claude Desktop local MCP is local to one machine. Use this on the same computer that has Revit open, pyRevit installed, and the `RevitMCP.extension` files available. If a coworker on another computer needs access to your live Revit session, use `Share the Web UI on Your LAN` instead.
 
 1.  Install Claude Desktop: `https://claude.ai/download`
 2.  In Claude Desktop, go to `Settings -> Developer -> Local MCP Servers -> Edit Config`.
@@ -169,15 +215,32 @@ Expected Claude Desktop screen after `revitmcp` is configured:
 *   Fully quit Claude Desktop from the system tray and reopen it.
 *   Check `%APPDATA%\Claude\logs`.
 
+If the log says `can't open file ... RevitMCP.extension\lib\RevitMCP_ExternalServer\server.py`, Claude is pointing at a path that does not exist. On the same machine as Claude Desktop, run:
+
+```powershell
+Test-Path "$env:APPDATA\pyRevit\Extensions\RevitMCP.extension\lib\RevitMCP_ExternalServer\server.py"
+Get-ChildItem "$env:APPDATA\pyRevit\Extensions" -Directory
+```
+
+If `Test-Path` returns `False`, either install/copy the extension to that exact `RevitMCP.extension` folder or update the Claude config to the real absolute path of `server.py`.
+
 ### Claude Desktop can see `revitmcp` but tools do not work
 
 *   Make sure Revit is open with a project loaded.
 *   Make sure pyRevit Routes is enabled.
 *   Restart Revit after enabling Routes.
 *   Open `View Logs` for `revitmcp` in Claude Desktop.
+*   Make sure Claude Desktop is running on the same machine as Revit. This MCP mode connects to the local Revit Routes server.
 
 ### Web UI or server startup issues
 
 *   Check `%USERPROFILE%\Documents\RevitMCP\server_logs`
 *   Startup log: `server_startup_error.log`
 *   App log: `server_app.log`
+
+### Coworker cannot open the Web UI
+
+*   If the server prints `Running on http://127.0.0.1:8000`, it is only listening locally. Follow `Share the Web UI on Your LAN` above.
+*   The coworker should use `http://<Revit computer IPv4>:8000`, not `http://127.0.0.1:8000`.
+*   If Windows prompts for firewall access when the server starts, allow private networks.
+*   If the terminal only shows a Python 3.14 Pydantic warning and never prints `Running on ...`, install Python 3.13 or older and configure RevitMCP to use that interpreter.

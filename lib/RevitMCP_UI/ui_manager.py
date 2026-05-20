@@ -119,6 +119,7 @@ def _get_default_settings():
             "max_messages_per_session": 50
         },
         "servers": {
+            "external_server_host": "127.0.0.1",
             "external_server_port": 8000,
             "listener_port": 8001,
             "auto_install_packages": True # Matches current behavior of _check_python_environment
@@ -184,12 +185,35 @@ def get_or_create_settings():
         _save_settings_file(settings) # Save the newly created default settings
     else:
         # Lightweight migration for older settings files.
+        changed = False
         preferences = settings.get("preferences", {})
         if not isinstance(preferences, dict):
             preferences = {}
             settings["preferences"] = preferences
+            changed = True
         if "server_surface" not in preferences:
             preferences["server_surface"] = "web"
+            changed = True
+
+        servers = settings.get("servers", {})
+        if not isinstance(servers, dict):
+            servers = {}
+            settings["servers"] = servers
+            changed = True
+        if "external_server_host" not in servers:
+            servers["external_server_host"] = "127.0.0.1"
+            changed = True
+        if "external_server_port" not in servers:
+            servers["external_server_port"] = 8000
+            changed = True
+        if "listener_port" not in servers:
+            servers["listener_port"] = 8001
+            changed = True
+        if "auto_install_packages" not in servers:
+            servers["auto_install_packages"] = True
+            changed = True
+
+        if changed:
             _save_settings_file(settings)
     return settings
 
@@ -342,6 +366,38 @@ def show_alert(message, title="RevitMCP"):
     else:
         print("[{}] {}".format(title, message))
 
+def _normalize_server_host(value):
+    if value is None:
+        return "127.0.0.1"
+
+    host = "{}".format(value).strip()
+    if not host:
+        return "127.0.0.1"
+    return host
+
+def _normalize_server_port(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return 8000
+
+    if port < 1 or port > 65535:
+        return 8000
+    return port
+
+def _build_external_server_environment(settings_data, base_env=None):
+    env = dict(base_env or os.environ.copy())
+    servers = settings_data.get("servers", {})
+    if not isinstance(servers, dict):
+        servers = {}
+
+    host = _normalize_server_host(servers.get("external_server_host", "127.0.0.1"))
+    port = _normalize_server_port(servers.get("external_server_port", 8000))
+
+    env["FLASK_HOST"] = host
+    env["FLASK_PORT"] = str(port)
+    return env, host, port
+
 def start_external_server():
     global SERVER_PROCESS
     
@@ -375,7 +431,11 @@ def start_external_server():
         print("[UI_MANAGER] Using Python executable: {}".format(python_exe_to_use))
         print("[UI_MANAGER] Selected server surface: {}".format(preferred_surface))
         try:
-            env = os.environ.copy()
+            env, server_host, server_port = _build_external_server_environment(current_settings)
+            print("[UI_MANAGER] Web server host: {}".format(server_host))
+            print("[UI_MANAGER] Web server port: {}".format(server_port))
+            if server_host in ["0.0.0.0", "::"]:
+                print("[UI_MANAGER] LAN access enabled. Use this computer's LAN IP address from another machine.")
             print("[UI_MANAGER] Starting Popen with command: {}".format(' '.join(launch_cmd)))
             SERVER_PROCESS = subprocess.Popen(
                 launch_cmd,
