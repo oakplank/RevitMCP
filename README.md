@@ -99,6 +99,8 @@ git clone https://github.com/oakplank/RevitMCP.git "%APPDATA%\pyRevit\Extensions
 
 The folder name matters: pyRevit discovers extensions by folders that end with `.extension`.
 
+Keep track of the exact `RevitMCP.extension` folder you install here. Claude Desktop must point to the `server.py` file inside this same folder. Do not point Claude at the pyRevit install folder unless that is actually where this extension is installed.
+
 ## Enable Revit Routes
 
 1.  Open Revit.
@@ -167,7 +169,27 @@ Claude Desktop local MCP is local to one machine. Use this on the same computer 
 
 1.  Install Claude Desktop: `https://claude.ai/download`
 2.  In Claude Desktop, go to `Settings -> Developer -> Local MCP Servers -> Edit Config`.
-3.  Add `revitmcp` to your Claude config.
+3.  Find the exact `server.py` path inside the same `RevitMCP.extension` folder that pyRevit loads.
+
+If you installed under your user extension root:
+
+```powershell
+$server = "$env:APPDATA\pyRevit\Extensions\RevitMCP.extension\lib\RevitMCP_ExternalServer\server.py"
+Test-Path $server
+$server
+```
+
+If you installed under the machine-wide extension root:
+
+```powershell
+$server = "$env:PROGRAMDATA\pyRevit\Extensions\RevitMCP.extension\lib\RevitMCP_ExternalServer\server.py"
+Test-Path $server
+$server
+```
+
+`Test-Path` must return `True`. Use the printed absolute path in the Claude config. Do not paste `%APPDATA%` or `%PROGRAMDATA%` literally into JSON; use the expanded path such as `C:\Users\YourName\AppData\Roaming\...`.
+
+4.  Add `revitmcp` to your Claude config.
 
 If your Claude config already exists, keep your current `preferences` and other MCP servers. Only add `revitmcp` under `mcpServers`.
 
@@ -179,7 +201,7 @@ If you copy the full example below, update the `preferences` values to match you
     "revitmcp": {
       "command": "python",
       "args": [
-        "C:\\Program Files\\pyRevit-Master\\extensions\\RevitMCP.extension\\lib\\RevitMCP_ExternalServer\\server.py",
+        "C:\\Users\\YourName\\AppData\\Roaming\\pyRevit\\Extensions\\RevitMCP.extension\\lib\\RevitMCP_ExternalServer\\server.py",
         "--surface",
         "mcp"
       ]
@@ -195,11 +217,11 @@ If you copy the full example below, update the `preferences` values to match you
 }
 ```
 
-4.  Replace the example `server.py` path with the actual path on your machine.
-5.  If `python` does not work, replace it with the full path to `python.exe`.
-6.  Save the file and fully restart Claude Desktop.
-7.  Re-open `Settings -> Developer -> Local MCP Servers` and confirm `revitmcp` shows `running`.
-8.  Try: `Get Revit project info`
+5.  Replace the example `server.py` path with the actual path from step 3.
+6.  If `python` does not work, replace it with the full path to `python.exe`.
+7.  Save the file and fully restart Claude Desktop.
+8.  Re-open `Settings -> Developer -> Local MCP Servers` and confirm `revitmcp` shows `running`.
+9.  Try: `Get Revit project info`
 
 Expected Claude Desktop screen after `revitmcp` is configured:
 
@@ -219,10 +241,12 @@ If the log says `can't open file ... RevitMCP.extension\lib\RevitMCP_ExternalSer
 
 ```powershell
 Test-Path "$env:APPDATA\pyRevit\Extensions\RevitMCP.extension\lib\RevitMCP_ExternalServer\server.py"
+Test-Path "$env:PROGRAMDATA\pyRevit\Extensions\RevitMCP.extension\lib\RevitMCP_ExternalServer\server.py"
 Get-ChildItem "$env:APPDATA\pyRevit\Extensions" -Directory
+Get-ChildItem "$env:PROGRAMDATA\pyRevit\Extensions" -Directory
 ```
 
-If `Test-Path` returns `False`, either install/copy the extension to that exact `RevitMCP.extension` folder or update the Claude config to the real absolute path of `server.py`.
+If both `Test-Path` commands return `False`, either install/copy the extension to one of those `RevitMCP.extension` folders or update the Claude config to the real absolute path of `server.py` in the extension folder pyRevit is actually loading.
 
 ### Claude Desktop can see `revitmcp` but tools do not work
 
