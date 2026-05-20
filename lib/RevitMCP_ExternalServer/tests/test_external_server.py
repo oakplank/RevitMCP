@@ -36,14 +36,16 @@ def write_tiny_png(path: str) -> None:
 
 from RevitMCP_ExternalServer.bootstrap import create_application
 from RevitMCP_ExternalServer.core.memory_store import MemoryStore
-from RevitMCP_ExternalServer.core.runtime_config import resolve_runtime_surface
+from RevitMCP_ExternalServer.core.runtime_config import load_runtime_config, resolve_runtime_surface
 from RevitMCP_ExternalServer.providers.anthropic_provider import run_anthropic_chat
 from RevitMCP_ExternalServer.providers.google_provider import run_google_chat
 from RevitMCP_ExternalServer.providers.openai_provider import run_openai_chat
 from RevitMCP_ExternalServer.tools.context_tools import resolve_revit_targets_internal
 from RevitMCP_ExternalServer.tools.element_tools import (
     filter_stored_elements_by_parameter_handler,
+    get_element_relationships_handler,
     get_element_properties_handler,
+    get_related_element_properties_handler,
     get_revit_diagnostics_handler,
     select_elements_by_id_handler,
 )
@@ -53,12 +55,23 @@ from RevitMCP_ExternalServer.tools.element_operation_tools import (
 )
 from RevitMCP_ExternalServer.tools.model_tools import analyze_model_statistics_handler
 from RevitMCP_ExternalServer.tools.registry import ToolDefinition, ToolRegistry, build_tool_registry
+from RevitMCP_ExternalServer.tools.schedule_tools import (
+    compare_schedules_handler,
+    create_schedule_handler,
+    delete_schedule_handler,
+    duplicate_schedule_handler,
+    get_schedule_info_handler,
+    get_schedule_rows_handler,
+    list_schedules_handler,
+    update_schedule_handler,
+)
 from RevitMCP_ExternalServer.tools.view_tools import (
     activate_view_handler,
     duplicate_view_handler,
     export_active_view_image_handler,
 )
 from RevitMCP_ExternalServer.web.chat_service import run_chat_request
+from RevitMCP_UI import ui_manager
 from routes.json_safety import sanitize_for_json
 
 
@@ -119,12 +132,23 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("get_revit_memory_context", definition_map)
         self.assertIn("save_revit_memory_note", definition_map)
         self.assertIn("get_revit_diagnostics", definition_map)
+        self.assertIn("get_element_relationships", definition_map)
+        self.assertIn("get_related_element_properties", definition_map)
         self.assertIn("analyze_model_statistics", definition_map)
         self.assertIn("override_element_graphics", definition_map)
         self.assertIn("delete_elements", definition_map)
         self.assertIn("activate_view", definition_map)
         self.assertIn("export_active_view_image", definition_map)
         self.assertIn("duplicate_view", definition_map)
+        self.assertIn("list_schedules", definition_map)
+        self.assertIn("get_schedule_info", definition_map)
+        self.assertIn("list_schedule_available_fields", definition_map)
+        self.assertIn("get_schedule_rows", definition_map)
+        self.assertIn("compare_schedules", definition_map)
+        self.assertIn("duplicate_schedule", definition_map)
+        self.assertIn("delete_schedule", definition_map)
+        self.assertIn("create_schedule", definition_map)
+        self.assertIn("update_schedule", definition_map)
 
     def test_dispatch_known_and_unknown_tool(self):
         app, _mcp_server, services, registry = create_application(
@@ -188,6 +212,21 @@ class RouteJsonSafetyTests(unittest.TestCase):
 
         self.assertEqual(sanitized["views"][0]["name"], "Caf\\xe9 Section")
         self.assertEqual(sanitized["views"][0]["sheet_name"], "Etage \\xe9")
+
+    def test_sanitize_for_json_escapes_degree_symbols_in_parameter_values(self):
+        payload = {
+            "typed_properties": {
+                "Angle Mullion Left": {
+                    "display_value": "45°",
+                    "numeric_value": 0.785398,
+                }
+            }
+        }
+
+        sanitized = sanitize_for_json(payload)
+
+        self.assertEqual(sanitized["typed_properties"]["Angle Mullion Left"]["display_value"], "45\\xb0")
+        self.assertEqual(sanitized["typed_properties"]["Angle Mullion Left"]["numeric_value"], 0.785398)
 
 
 class ProviderTests(unittest.TestCase):
@@ -349,6 +388,7 @@ class ChatServiceTests(unittest.TestCase):
             launch_background_tasks=False,
             detect_revit_on_startup=False,
         )
+        memory_path = make_workspace_temp_file_path("chat_service")
 
         class FakeOpenAIClient:
             def __init__(self, **_kwargs):
@@ -358,17 +398,22 @@ class ChatServiceTests(unittest.TestCase):
                 message = SimpleNamespace(content="openai explicit ok", tool_calls=[])
                 return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
-        response_payload, status_code = run_chat_request(
-            services,
-            registry,
-            {
-                "conversation": [{"role": "user", "content": "test"}],
-                "model": "custom-openai-model",
-                "provider": "openai",
-                "apiKey": "key",
-            },
-            openai_client_factory=FakeOpenAIClient,
-        )
+        try:
+            services.memory_store.storage_path = memory_path
+            response_payload, status_code = run_chat_request(
+                services,
+                registry,
+                {
+                    "conversation": [{"role": "user", "content": "test"}],
+                    "model": "custom-openai-model",
+                    "provider": "openai",
+                    "apiKey": "key",
+                },
+                openai_client_factory=FakeOpenAIClient,
+            )
+        finally:
+            if os.path.exists(memory_path):
+                os.remove(memory_path)
 
         self.assertEqual(status_code, 200)
         self.assertEqual(response_payload["reply"], "openai explicit ok")
@@ -378,21 +423,245 @@ class ChatServiceTests(unittest.TestCase):
             launch_background_tasks=False,
             detect_revit_on_startup=False,
         )
+        memory_path = make_workspace_temp_file_path("chat_service_unknown")
 
-        response_payload, status_code = run_chat_request(
-            services,
-            registry,
-            {
-                "conversation": [{"role": "user", "content": "test"}],
-                "model": "custom-model",
-                "provider": "not-real",
-                "apiKey": "key",
-            },
-        )
+        try:
+            services.memory_store.storage_path = memory_path
+            response_payload, status_code = run_chat_request(
+                services,
+                registry,
+                {
+                    "conversation": [{"role": "user", "content": "test"}],
+                    "model": "custom-model",
+                    "provider": "not-real",
+                    "apiKey": "key",
+                },
+            )
+        finally:
+            if os.path.exists(memory_path):
+                os.remove(memory_path)
 
         self.assertIsNotNone(app)
         self.assertEqual(status_code, 500)
         self.assertIn("provider 'not-real'", response_payload["error"])
+
+
+class ScheduleToolTests(unittest.TestCase):
+    def make_services(self, response=None):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return response or {"status": "success", "message": "ok"}
+
+            def is_route_not_defined(self, *_args, **_kwargs):
+                return False
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            result_store=SimpleNamespace(compact_result_payload=lambda result, preserve_keys=None: result),
+            revit_client=FakeRevitClient(),
+        )
+        return services, calls
+
+    def test_list_schedules_posts_search_payload(self):
+        services, calls = self.make_services(
+            {
+                "status": "success",
+                "schedules": [{"id": "10", "name": "Door Schedule"}],
+                "count": 1,
+            }
+        )
+
+        result = list_schedules_handler(services, schedule_name="Door", exact_match=True, limit=5000)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/schedules/list")
+        self.assertEqual(calls[0][1], "POST")
+        self.assertEqual(calls[0][2]["schedule_name"], "Door")
+        self.assertTrue(calls[0][2]["exact_match"])
+        self.assertEqual(calls[0][2]["limit"], 1000)
+
+    def test_get_schedule_info_requires_identifier(self):
+        services, _calls = self.make_services()
+
+        result = get_schedule_info_handler(services)
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("schedule_id", result["message"])
+
+    def test_create_schedule_posts_definition_payload(self):
+        services, calls = self.make_services(
+            {
+                "status": "success",
+                "schedule": {"id": "99", "name": "Door Hardware"},
+            }
+        )
+
+        result = create_schedule_handler(
+            services,
+            schedule_name="Door Hardware",
+            category_name="Doors",
+            fields=["Mark", {"name": "Level", "hidden": True}],
+            filters=[{"field_name": "Mark", "operator": "contains", "value": "A"}],
+            sort_fields=[{"field_name": "Level", "order": "ascending"}],
+            settings={"is_itemized": True},
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/schedules/create")
+        self.assertEqual(calls[0][2]["schedule_name"], "Door Hardware")
+        self.assertEqual(calls[0][2]["category_name"], "Doors")
+        self.assertEqual(calls[0][2]["fields"][0], "Mark")
+        self.assertEqual(calls[0][2]["filters"][0]["operator"], "contains")
+        self.assertTrue(calls[0][2]["settings"]["is_itemized"])
+
+    def test_create_schedule_allows_available_field_index_selectors(self):
+        services, calls = self.make_services({"status": "success"})
+
+        result = create_schedule_handler(
+            services,
+            schedule_name="MR- 2.04 Diagnostic",
+            category_name="Curtain Panels",
+            fields=[{"available_field_index": 97, "column_heading": "Material: Mark"}],
+            filters=[{"available_field_index": 140, "operator": "equals", "value": "MR- 2.04"}],
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][2]["fields"][0]["available_field_index"], 97)
+        self.assertEqual(calls[0][2]["filters"][0]["available_field_index"], 140)
+
+    def test_create_schedule_posts_material_takeoff_option(self):
+        services, calls = self.make_services({"status": "success"})
+
+        result = create_schedule_handler(
+            services,
+            schedule_name="MR- 2.04 Diagnostic",
+            category_name="Windows",
+            schedule_kind="material_takeoff",
+            fields=[{"name": "Material: Mark"}],
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/schedules/create")
+        self.assertEqual(calls[0][2]["schedule_kind"], "material_takeoff")
+
+    def test_duplicate_schedule_posts_duplicate_view_payload(self):
+        services, calls = self.make_services(
+            {
+                "status": "success",
+                "new_view": {"id": "100", "name": "DIAG- MR2.04 Audit"},
+            }
+        )
+
+        result = duplicate_schedule_handler(
+            services,
+            schedule_name="MR- 2.04 Overall",
+            new_name="DIAG- MR2.04 Audit",
+            exact_match=True,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/views/duplicate")
+        self.assertEqual(calls[0][2]["view_name"], "MR- 2.04 Overall")
+        self.assertEqual(calls[0][2]["new_name"], "DIAG- MR2.04 Audit")
+        self.assertEqual(calls[0][2]["duplicate_option"], "duplicate")
+
+    def test_delete_schedule_defaults_to_dry_run(self):
+        services, calls = self.make_services({"status": "dry_run", "candidate_id": "100"})
+
+        result = delete_schedule_handler(services, schedule_name="TEST- Material Takeoff - DELETE ME", exact_match=True)
+
+        self.assertEqual(result["status"], "dry_run")
+        self.assertEqual(calls[0][0], "/schedules/delete")
+        self.assertEqual(calls[0][2]["schedule_name"], "TEST- Material Takeoff - DELETE ME")
+        self.assertTrue(calls[0][2]["dry_run"])
+        self.assertFalse(calls[0][2]["confirm_delete"])
+
+    def test_delete_schedule_posts_confirmed_delete_payload(self):
+        services, calls = self.make_services({"status": "success", "deleted_input_id": "100"})
+
+        result = delete_schedule_handler(
+            services,
+            schedule_id="100",
+            dry_run=False,
+            confirm_delete=True,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/schedules/delete")
+        self.assertEqual(calls[0][2]["schedule_id"], "100")
+        self.assertFalse(calls[0][2]["dry_run"])
+        self.assertTrue(calls[0][2]["confirm_delete"])
+
+    def test_get_schedule_rows_posts_row_read_payload(self):
+        services, calls = self.make_services({"status": "success", "rows": []})
+
+        result = get_schedule_rows_handler(services, schedule_name="MR- 2.04 Overall", max_rows=50000)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/schedules/rows")
+        self.assertEqual(calls[0][2]["schedule_name"], "MR- 2.04 Overall")
+        self.assertEqual(calls[0][2]["max_rows"], 10000)
+        self.assertFalse(calls[0][2]["include_header_rows"])
+
+    def test_get_schedule_rows_can_include_header_rows_on_request(self):
+        services, calls = self.make_services({"status": "success", "rows": []})
+
+        result = get_schedule_rows_handler(
+            services,
+            schedule_name="MR- 2.04 Overall",
+            include_header_rows=True,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(calls[0][2]["include_header_rows"])
+
+    def test_compare_schedules_posts_quantity_audit_payload(self):
+        services, calls = self.make_services({"status": "success", "totals": {"delta": 0}})
+
+        result = compare_schedules_handler(
+            services,
+            overall_schedule_name="MR- 2.04 Overall",
+            release_schedule_name_contains="MR- 2.04",
+            exclude_schedule_names=["Overall"],
+            release_schedules_on_sheets_only=True,
+            key_fields=[{"name": "Part Number"}],
+            quantity_field="Quantity",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/schedules/compare")
+        self.assertEqual(calls[0][2]["overall_schedule_name"], "MR- 2.04 Overall")
+        self.assertEqual(calls[0][2]["release_schedule_name_contains"], "MR- 2.04")
+        self.assertTrue(calls[0][2]["release_schedules_on_sheets_only"])
+        self.assertEqual(calls[0][2]["key_fields"][0]["name"], "Part Number")
+        self.assertEqual(calls[0][2]["quantity_field"], "Quantity")
+
+    def test_update_schedule_requires_operation(self):
+        services, _calls = self.make_services()
+
+        result = update_schedule_handler(services, schedule_id="99")
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("operation", result["message"])
+
+    def test_update_schedule_posts_filter_replacement_payload(self):
+        services, calls = self.make_services({"status": "success", "changes": {"cleared_filters": 1}})
+
+        result = update_schedule_handler(
+            services,
+            schedule_id="99",
+            filters=[{"field_name": "Comments", "operator": "equals", "value": "Issued"}],
+            replace_filters=True,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/schedules/update")
+        self.assertEqual(calls[0][2]["schedule_id"], "99")
+        self.assertTrue(calls[0][2]["replace_filters"])
+        self.assertEqual(calls[0][2]["filters"][0]["field_name"], "Comments")
 
 
 class ViewToolTests(unittest.TestCase):
@@ -956,6 +1225,226 @@ class ElementToolTests(unittest.TestCase):
         self.assertEqual(property_reads[1][2]["element_ids"], [str(value) for value in range(21, 41)])
         self.assertEqual(property_reads[2][2]["element_ids"], [str(value) for value in range(41, 46)])
 
+    def test_get_element_properties_can_page_beyond_per_call_read_cap(self):
+        property_reads = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                property_reads.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "count": len(payload_data["element_ids"]),
+                    "elements": [
+                        {
+                            "element_id": element_id,
+                            "properties": {"Glazing Step": "STL @ 32mm"},
+                            "typed_properties": {},
+                        }
+                        for element_id in payload_data["element_ids"]
+                    ],
+                }
+
+            def is_route_not_defined(self, *_args, **_kwargs):
+                return False
+
+        class FakeResultStore:
+            def resolve_element_ids(self, **_kwargs):
+                return [str(value) for value in range(1, 702)], {"storage_key": "windows"}, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(
+                max_elements_for_property_read=300,
+                max_records_in_response=20,
+            ),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        first_page = get_element_properties_handler(
+            services,
+            result_handle="res_glazing_step",
+            parameter_names=["Glazing Step"],
+            limit=300,
+        )
+        third_page = get_element_properties_handler(
+            services,
+            result_handle="res_glazing_step",
+            parameter_names=["Glazing Step"],
+            offset=600,
+            limit=300,
+        )
+
+        self.assertEqual(first_page["source_count"], 701)
+        self.assertEqual(first_page["pageable_count"], 701)
+        self.assertEqual(first_page["returned_count"], 300)
+        self.assertTrue(first_page["has_more"])
+        self.assertEqual(first_page["next_offset"], 300)
+        self.assertEqual(third_page["returned_count"], 101)
+        self.assertFalse(third_page["has_more"])
+        self.assertEqual(property_reads[0][2]["element_ids"][0], "1")
+        self.assertEqual(property_reads[0][2]["element_ids"][-1], "300")
+        self.assertEqual(property_reads[1][2]["element_ids"][0], "601")
+        self.assertEqual(property_reads[1][2]["element_ids"][-1], "701")
+
+    def test_get_element_relationships_posts_batch_relationship_payload(self):
+        relationship_reads = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                relationship_reads.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "relationships": [
+                        {
+                            "element_id": element_id,
+                            "status": "success",
+                            "element": {"element_id": element_id},
+                            "host": {"element_id": "900"},
+                        }
+                        for element_id in payload_data["element_ids"]
+                    ],
+                }
+
+            def is_route_not_defined(self, *_args, **_kwargs):
+                return False
+
+        class FakeResultStore:
+            def resolve_element_ids(self, **_kwargs):
+                return ["101", "102", "103"], {"storage_key": "windows"}, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(
+                max_elements_for_property_read=300,
+                max_records_in_response=20,
+            ),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = get_element_relationships_handler(
+            services,
+            result_handle="res_windows",
+            include_host_chain=True,
+            include_children=False,
+            include_dependents=True,
+            include_adaptive_points=True,
+            max_depth=99,
+            max_children=9999,
+            limit=2,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["returned_count"], 2)
+        self.assertTrue(result["has_more"])
+        self.assertEqual(result["next_offset"], 2)
+        self.assertEqual(relationship_reads[0][0], "/elements/relationships")
+        self.assertEqual(relationship_reads[0][2]["element_ids"], ["101", "102"])
+        self.assertTrue(relationship_reads[0][2]["include_host_chain"])
+        self.assertFalse(relationship_reads[0][2]["include_children"])
+        self.assertTrue(relationship_reads[0][2]["include_dependents"])
+        self.assertTrue(relationship_reads[0][2]["include_adaptive_points"])
+        self.assertEqual(relationship_reads[0][2]["max_depth"], 20)
+        self.assertEqual(relationship_reads[0][2]["max_children"], 1000)
+
+    def test_get_related_element_properties_joins_source_and_parent_properties(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                if command_path == "/elements/relationships":
+                    return {
+                        "status": "success",
+                        "relationships": [
+                            {
+                                "element_id": "101",
+                                "status": "success",
+                                "element": {"element_id": "101", "category": "Windows"},
+                                "host": None,
+                                "super_component": {"element_id": "201", "category": "Curtain Panels"},
+                                "host_chain": [
+                                    {"element_id": "201", "relationship": "super_component"},
+                                    {"element_id": "301", "relationship": "super_component"},
+                                ],
+                            },
+                            {
+                                "element_id": "102",
+                                "status": "success",
+                                "element": {"element_id": "102", "category": "Windows"},
+                                "host": {"element_id": "202", "category": "Walls"},
+                                "super_component": None,
+                                "host_chain": [{"element_id": "202", "relationship": "host"}],
+                            },
+                        ],
+                    }
+                if command_path == "/elements/get_properties":
+                    parameter_names = payload_data.get("parameter_names", [])
+                    return {
+                        "status": "success",
+                        "elements": [
+                            {
+                                "element_id": element_id,
+                                "properties": {name: "{}-{}".format(name, element_id) for name in parameter_names},
+                                "typed_properties": {},
+                            }
+                            for element_id in payload_data["element_ids"]
+                        ],
+                    }
+                return {"status": "error", "message": "Unexpected route"}
+
+            def is_route_not_defined(self, *_args, **_kwargs):
+                return False
+
+        class FakeResultStore:
+            def resolve_element_ids(self, **_kwargs):
+                return ["101", "102"], {"storage_key": "windows"}, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(
+                max_elements_for_property_read=300,
+                max_records_in_response=20,
+            ),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = get_related_element_properties_handler(
+            services,
+            result_handle="res_windows",
+            source_parameter_names=["Comments"],
+            related_parameter_names=["Side 1"],
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["returned_count"], 2)
+        self.assertEqual(result["related_element_ids"], ["201", "301", "202"])
+        self.assertEqual(calls[0][0], "/elements/relationships")
+        self.assertEqual(calls[0][2]["element_ids"], ["101", "102"])
+        self.assertEqual(calls[0][2]["max_depth"], 3)
+        self.assertFalse(calls[0][2]["include_children"])
+        self.assertEqual(calls[1][0], "/elements/get_properties")
+        self.assertEqual(calls[1][2]["element_ids"], ["101", "102"])
+        self.assertEqual(calls[1][2]["parameter_names"], ["Comments"])
+        self.assertEqual(calls[2][0], "/elements/get_properties")
+        self.assertEqual(calls[2][2]["element_ids"], ["201", "301", "202"])
+        self.assertEqual(calls[2][2]["parameter_names"], ["Side 1"])
+        self.assertEqual(result["items"][0]["source_properties"]["Comments"], "Comments-101")
+        self.assertEqual(result["items"][0]["super_component"]["properties"]["Side 1"], "Side 1-201")
+        self.assertEqual(result["items"][0]["host_chain"][1]["properties"]["Side 1"], "Side 1-301")
+        self.assertIsNone(result["items"][1]["super_component"])
+
     def test_get_element_properties_explicit_limit_returns_full_page_for_exports(self):
         property_reads = []
         compact_calls = []
@@ -1175,6 +1664,46 @@ class CompatibilityTests(unittest.TestCase):
 
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(resolve_runtime_surface([]), "web")
+
+    def test_runtime_config_honors_flask_host_and_port_environment(self):
+        with patch.dict(os.environ, {"FLASK_HOST": "0.0.0.0", "FLASK_PORT": "8123"}, clear=True):
+            config = load_runtime_config()
+
+        self.assertEqual(config.host, "0.0.0.0")
+        self.assertEqual(config.port, 8123)
+
+    def test_launcher_passes_configured_host_and_port_to_external_server(self):
+        env, host, port = ui_manager._build_external_server_environment(
+            {
+                "servers": {
+                    "external_server_host": "0.0.0.0",
+                    "external_server_port": 8123,
+                }
+            },
+            base_env={"EXISTING": "1"},
+        )
+
+        self.assertEqual(host, "0.0.0.0")
+        self.assertEqual(port, 8123)
+        self.assertEqual(env["FLASK_HOST"], "0.0.0.0")
+        self.assertEqual(env["FLASK_PORT"], "8123")
+        self.assertEqual(env["EXISTING"], "1")
+
+    def test_launcher_defaults_to_localhost_for_invalid_server_settings(self):
+        env, host, port = ui_manager._build_external_server_environment(
+            {
+                "servers": {
+                    "external_server_host": "",
+                    "external_server_port": "not-a-port",
+                }
+            },
+            base_env={},
+        )
+
+        self.assertEqual(host, "127.0.0.1")
+        self.assertEqual(port, 8000)
+        self.assertEqual(env["FLASK_HOST"], "127.0.0.1")
+        self.assertEqual(env["FLASK_PORT"], "8000")
 
 
 if __name__ == "__main__":
