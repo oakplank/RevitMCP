@@ -70,6 +70,18 @@ def _coerce_bool(value, default=False):
     return default
 
 
+def _coerce_int(value, default=0, min_value=None, max_value=None):
+    try:
+        number = int(value if value is not None else default)
+    except Exception:
+        number = int(default)
+    if min_value is not None:
+        number = max(min_value, number)
+    if max_value is not None:
+        number = min(max_value, number)
+    return number
+
+
 def _payload_from_request(request):
     if request is not None and hasattr(request, "data") and isinstance(request.data, dict):
         return request.data
@@ -477,6 +489,24 @@ def _schedule_field_summary(field, doc, index=None):
         "field_type": _enum_text(getattr(field, "FieldType", None)),
         "parameter_id": _id_text(parameter_id),
     }
+    try:
+        summary["is_calculated_field"] = bool(field.IsCalculatedField)
+    except Exception:
+        pass
+    try:
+        summary["percentage_of_field_id"] = _field_id_key(field.PercentageOf)
+    except Exception:
+        pass
+    try:
+        summary["percentage_by_field_id"] = _field_id_key(field.PercentageBy)
+    except Exception:
+        pass
+    try:
+        spec_type_id = field.GetSpecTypeId()
+        if spec_type_id:
+            summary["spec_type_id"] = _safe_text(spec_type_id.TypeId)
+    except Exception:
+        pass
     for method_name, key in [
         ("CanFilter", "can_filter"),
         ("CanSort", "can_sort"),
@@ -739,6 +769,11 @@ def _add_schedule_field(definition, doc, field_spec, default_hidden=None):
     except Exception as add_error:
         return None, None, "Could not add field '{}': {}".format(spec.get("name", spec), add_error)
 
+    _apply_schedule_field_options(field, spec, default_hidden=default_hidden)
+    return field, _schedule_field_summary(field, doc), None
+
+
+def _apply_schedule_field_options(field, spec, default_hidden=None):
     hidden = spec.get("hidden")
     if hidden is None:
         hidden = spec.get("is_hidden")
@@ -756,8 +791,11 @@ def _add_schedule_field(definition, doc, field_spec, default_hidden=None):
             field.ColumnHeading = str(column_heading)
         except Exception:
             pass
-
-    return field, _schedule_field_summary(field, doc), None
+    elif spec.get("name") is not None:
+        try:
+            field.ColumnHeading = str(spec.get("name"))
+        except Exception:
+            pass
 
 
 def _ensure_schedule_field(definition, doc, field_spec, hidden_when_added=True):
@@ -765,6 +803,87 @@ def _ensure_schedule_field(definition, doc, field_spec, hidden_when_added=True):
     if field:
         return field, summary, None
     return _add_schedule_field(definition, doc, field_spec, default_hidden=hidden_when_added)
+
+
+def _calculated_field_kind(spec):
+    raw_kind = (
+        spec.get("kind")
+        or spec.get("calculation_type")
+        or spec.get("field_type")
+        or spec.get("type")
+        or ""
+    )
+    normalized = _normalize_text(raw_kind)
+    if normalized in ("", "formula", "calculated", "calculatedvalue"):
+        return "formula", None
+    if normalized in ("percentage", "percent"):
+        return "percentage", None
+    return None, "Unsupported calculated field kind '{}'. Use 'formula' or 'percentage'.".format(
+        _safe_text(raw_kind)
+    )
+
+
+def _calculated_formula_text(spec):
+    for key in ("formula", "expression", "formula_text"):
+        if spec.get(key) is not None:
+            return _safe_text(spec.get(key))
+    return ""
+
+
+def _add_calculated_schedule_field(definition, doc, field_spec):
+    if not isinstance(field_spec, dict):
+        return None, None, "Calculated field spec must be an object."
+
+    spec = dict(field_spec)
+    kind, kind_error = _calculated_field_kind(spec)
+    if kind_error:
+        return None, None, kind_error
+
+    formula_text = _calculated_formula_text(spec)
+    if kind == "formula" and formula_text:
+        return None, None, (
+            "Revit API 2024 exposes ScheduleFieldType.Formula but does not expose a public formula text setter. "
+            "Cannot assign formula '{}'. Use a writable project/shared parameter workflow for computed values "
+            "that must be scheduled, or create the formula field manually in Revit."
+        ).format(formula_text)
+
+    try:
+        if kind == "percentage":
+            field = definition.AddField(DB.ScheduleFieldType.Percentage)
+        else:
+            field = definition.AddField(DB.ScheduleFieldType.Formula)
+    except Exception as add_error:
+        return None, None, "Could not add {} calculated field '{}': {}".format(
+            kind,
+            _safe_text(spec.get("name") or spec.get("column_heading") or ""),
+            add_error,
+        )
+
+    _apply_schedule_field_options(field, spec, default_hidden=None)
+
+    if kind == "percentage":
+        percentage_of_spec = spec.get("percentage_of") or spec.get("of")
+        if percentage_of_spec is None:
+            return None, None, "Percentage calculated field requires percentage_of."
+        percentage_of_field, _summary, error = _ensure_schedule_field(definition, doc, percentage_of_spec, hidden_when_added=False)
+        if error:
+            return None, None, "Could not resolve percentage_of field: {}".format(error)
+        try:
+            field.PercentageOf = percentage_of_field.FieldId
+        except Exception as error:
+            return None, None, "Could not set percentage_of field: {}".format(error)
+
+        percentage_by_spec = spec.get("percentage_by") or spec.get("by")
+        if percentage_by_spec is not None:
+            percentage_by_field, _summary, error = _ensure_schedule_field(definition, doc, percentage_by_spec, hidden_when_added=False)
+            if error:
+                return None, None, "Could not resolve percentage_by field: {}".format(error)
+            try:
+                field.PercentageBy = percentage_by_field.FieldId
+            except Exception as error:
+                return None, None, "Could not set percentage_by field: {}".format(error)
+
+    return field, _schedule_field_summary(field, doc), None
 
 
 def _filter_field_spec(filter_spec):
@@ -1534,6 +1653,326 @@ def _validate_schedule_name_for_create(doc, name, uniquify_name):
     return final_name, None
 
 
+def _audit_field_specs_from_payload(definition, doc, payload):
+    raw_fields = _as_list(payload.get("fields"))
+    max_fields = _coerce_int(payload.get("max_fields"), default=24, min_value=1, max_value=250)
+
+    if raw_fields:
+        return raw_fields[:max_fields], len(raw_fields)
+
+    available_fields = _available_schedulable_fields(definition, doc)
+    contains_text = _normalize_text(payload.get("field_name_contains"))
+    selected = []
+    selected_keys = set()
+
+    def add_available_field(schedulable_field, summary):
+        key = "{}|{}".format(summary.get("available_field_index"), summary.get("parameter_id"))
+        if key in selected_keys:
+            return
+        selected_keys.add(key)
+        selected.append({
+            "available_field_index": summary.get("available_field_index"),
+            "name": summary.get("name"),
+            "parameter_id": summary.get("parameter_id"),
+        })
+
+    if contains_text:
+        for schedulable_field, summary in available_fields:
+            if contains_text in _normalize_text(summary.get("name")):
+                add_available_field(schedulable_field, summary)
+                if len(selected) >= max_fields:
+                    break
+        return selected, len(available_fields)
+
+    preferred_names = [
+        "Count",
+        "Mark",
+        "Type Mark",
+        "Level",
+        "Family and Type",
+        "Material: Name",
+        "Material: Mark",
+        "Material: Description",
+        "Material: Area",
+        "Material: Volume",
+        "Width",
+        "Height",
+        "Side 1",
+        "Side 2",
+        "Part Number",
+        "Install Level",
+        "Comments",
+        "Workset",
+    ]
+    for preferred_name in preferred_names:
+        preferred_normalized = _normalize_text(preferred_name)
+        for schedulable_field, summary in available_fields:
+            if _normalize_text(summary.get("name")) == preferred_normalized:
+                add_available_field(schedulable_field, summary)
+                break
+        if len(selected) >= max_fields:
+            return selected, len(available_fields)
+
+    for schedulable_field, summary in available_fields:
+        add_available_field(schedulable_field, summary)
+        if len(selected) >= max_fields:
+            break
+    return selected, len(available_fields)
+
+
+def _audit_filter_operators_from_payload(payload):
+    operators = payload.get("filter_operators")
+    if operators:
+        return [str(operator).strip() for operator in _as_list(operators) if str(operator).strip()]
+    return [
+        "equals",
+        "not_equals",
+        "contains",
+        "not_contains",
+        "begins_with",
+        "ends_with",
+        "greater_than",
+        "less_than",
+        "has_value",
+        "has_no_value",
+    ]
+
+
+def _audit_filter_spec_for_field(field_summary, operator):
+    filter_spec = {
+        "field_id": field_summary.get("field_id"),
+        "operator": operator,
+    }
+    if operator not in ("has_parameter", "has_value", "has_no_value"):
+        if operator in ("greater_than", "greater_than_or_equal", "less_than", "less_than_or_equal"):
+            filter_spec["value"] = "1"
+        elif operator in ("contains", "not_contains", "begins_with", "not_begins_with", "ends_with", "not_ends_with"):
+            filter_spec["value"] = "A"
+            filter_spec["value_type"] = "string"
+        else:
+            filter_spec["value"] = "1"
+    return filter_spec
+
+
+def _audit_schedule_capabilities(doc, payload):
+    category, category_error = _find_category(
+        doc,
+        category_name=payload.get("category_name"),
+        category_id=payload.get("category_id"),
+    )
+    if category_error:
+        return routes.Response(status=400, data=sanitize_for_json({"status": "error", "error": category_error}))
+
+    schedule_kind = str(payload.get("schedule_kind") or payload.get("schedule_type") or "").strip().lower()
+    is_material_takeoff = _coerce_bool(payload.get("is_material_takeoff"), default=False)
+    if schedule_kind in ("material_takeoff", "material takeoff", "takeoff"):
+        is_material_takeoff = True
+    schedule_kind_label = "material_takeoff" if is_material_takeoff else "schedule"
+
+    include_filter_tests = _coerce_bool(payload.get("include_filter_tests"), default=True)
+    include_sort_tests = _coerce_bool(payload.get("include_sort_tests"), default=True)
+    include_settings_tests = _coerce_bool(payload.get("include_settings_tests"), default=True)
+    include_row_read = _coerce_bool(payload.get("include_row_read"), default=True)
+    max_filter_tests = _coerce_int(payload.get("max_filter_tests"), default=120, min_value=0, max_value=1000)
+
+    transaction = None
+    transaction_started = False
+    rolled_back = False
+    try:
+        transaction = DB.Transaction(doc, "RevitMCP Audit Schedule Capabilities")
+        transaction.Start()
+        transaction_started = True
+
+        if is_material_takeoff:
+            schedule = DB.ViewSchedule.CreateMaterialTakeoff(doc, category.Id)
+        else:
+            schedule = DB.ViewSchedule.CreateSchedule(doc, category.Id)
+        schedule.Name = _unique_schedule_name(doc, "__RevitMCP_CAPABILITY_AUDIT__")
+        definition = schedule.Definition
+
+        try:
+            doc.Regenerate()
+        except Exception:
+            pass
+
+        field_specs, available_field_count = _audit_field_specs_from_payload(definition, doc, payload)
+        field_tests = []
+        added_field_summaries = []
+
+        for field_spec in field_specs:
+            field_test = {
+                "requested": field_spec,
+                "can_add": False,
+                "error": None,
+            }
+            field, summary, field_error = _add_schedule_field(definition, doc, field_spec)
+            if field_error:
+                field_test["error"] = field_error
+            else:
+                field_test["can_add"] = True
+                field_test["field"] = summary
+                added_field_summaries.append(summary)
+            field_tests.append(field_test)
+
+        filter_tests = []
+        if include_filter_tests and max_filter_tests > 0:
+            operators = _audit_filter_operators_from_payload(payload)
+            tested_count = 0
+            for field_summary in added_field_summaries:
+                if tested_count >= max_filter_tests:
+                    break
+                for operator in operators:
+                    if tested_count >= max_filter_tests:
+                        break
+                    tested_count += 1
+                    filter_spec = _audit_filter_spec_for_field(field_summary, operator)
+                    filter_test = {
+                        "field": field_summary,
+                        "operator": operator,
+                        "supported": False,
+                        "error": None,
+                    }
+                    summary, filter_error = _add_or_set_filter(definition, doc, filter_spec, mode="add")
+                    if filter_error:
+                        filter_test["error"] = filter_error
+                    else:
+                        filter_test["supported"] = True
+                        filter_test["filter"] = summary
+                        try:
+                            definition.RemoveFilter(int(summary.get("index")))
+                        except Exception as remove_error:
+                            filter_test["remove_error"] = _safe_text(remove_error)
+                    filter_tests.append(filter_test)
+
+        sort_tests = []
+        if include_sort_tests:
+            for field_summary in added_field_summaries:
+                sort_test = {
+                    "field": field_summary,
+                    "supported": False,
+                    "error": None,
+                }
+                summary, sort_error = _add_or_set_sort_group_field(
+                    definition,
+                    doc,
+                    {"field_id": field_summary.get("field_id"), "order": "ascending"},
+                    mode="add",
+                )
+                if sort_error:
+                    sort_test["error"] = sort_error
+                else:
+                    sort_test["supported"] = True
+                    sort_test["sort_group_field"] = summary
+                    try:
+                        definition.RemoveSortGroupField(int(summary.get("index")))
+                    except Exception as remove_error:
+                        sort_test["remove_error"] = _safe_text(remove_error)
+                sort_tests.append(sort_test)
+
+        settings_tests = []
+        if include_settings_tests:
+            settings_probe = {
+                "is_itemized": True,
+                "show_grand_total": True,
+                "show_grand_total_count": True,
+                "show_grand_total_title": True,
+                "grand_total_title": "Audit Total",
+                "include_linked_files": False,
+                "show_headers": True,
+                "show_title": False,
+                "show_grid_lines": True,
+            }
+            applied = _apply_definition_settings(definition, settings_probe)
+            for key in sorted(settings_probe.keys()):
+                settings_tests.append({
+                    "setting": key,
+                    "requested_value": settings_probe[key],
+                    "supported": key in applied,
+                })
+
+        row_read_test = None
+        if include_row_read:
+            columns, rows_read, metadata = _read_schedule_rows(
+                schedule,
+                doc,
+                max_rows=3,
+                include_empty_rows=False,
+                include_header_rows=False,
+            )
+            if isinstance(metadata, STRING_TYPES):
+                row_read_test = {"supported": False, "error": metadata}
+            else:
+                row_read_test = {
+                    "supported": True,
+                    "columns_sample": columns[:12],
+                    "rows_sample": rows_read[:3],
+                    "metadata": metadata,
+                }
+
+        summary = {
+            "available_field_count": available_field_count,
+            "fields_tested": len(field_tests),
+            "fields_added": len([item for item in field_tests if item.get("can_add")]),
+            "filters_tested": len(filter_tests),
+            "filters_supported": len([item for item in filter_tests if item.get("supported")]),
+            "sorts_tested": len(sort_tests),
+            "sorts_supported": len([item for item in sort_tests if item.get("supported")]),
+            "settings_tested": len(settings_tests),
+            "settings_supported": len([item for item in settings_tests if item.get("supported")]),
+        }
+
+        result = {
+            "status": "success",
+            "message": "Audited schedule capabilities for category '{}' using rollback-only temporary {}.".format(
+                _safe_text(category.Name),
+                schedule_kind_label,
+            ),
+            "audit_mode": "rollback_transaction",
+            "rolled_back": False,
+            "category": _category_summary(category),
+            "schedule_kind": schedule_kind_label,
+            "can_create": True,
+            "temporary_schedule": _schedule_summary(schedule, doc),
+            "summary": summary,
+            "field_tests": field_tests,
+            "filter_tests": filter_tests,
+            "sort_tests": sort_tests,
+            "settings_tests": settings_tests,
+            "row_read_test": row_read_test,
+            "limitations": [
+                "Probe results are specific to this Revit version, document, category, and schedule kind.",
+                "The transaction is rolled back, so no temporary schedule should remain in the model.",
+                "Filter support is tested with representative sample values; user-specific values can still fail.",
+            ],
+        }
+
+        transaction.RollBack()
+        transaction_started = False
+        rolled_back = True
+        result["rolled_back"] = True
+        return sanitize_for_json(result)
+    except Exception as error:
+        if transaction and transaction_started:
+            try:
+                transaction.RollBack()
+                rolled_back = True
+            except Exception:
+                rolled_back = False
+        return routes.Response(
+            status=500,
+            data=sanitize_for_json({
+                "status": "error",
+                "error": "Internal server error while auditing schedule capabilities.",
+                "details": str(error),
+                "audit_mode": "rollback_transaction",
+                "rolled_back": rolled_back,
+                "category": _category_summary(category),
+                "schedule_kind": schedule_kind_label,
+                "can_create": False,
+            }),
+        )
+
+
 def register_routes(api):
     @api.route('/schedules/list', methods=['GET', 'POST'])
     def handle_list_schedules(doc, request=None):
@@ -1681,6 +2120,23 @@ def register_routes(api):
                 data=sanitize_for_json({
                     "status": "error",
                     "error": "Internal server error while reading schedule rows.",
+                    "details": str(e),
+                }),
+            )
+
+    @api.route('/schedules/audit_capabilities', methods=['POST'])
+    def handle_audit_schedule_capabilities(doc, request):
+        route_logger = script.get_logger()
+        try:
+            payload = _payload_from_request(request)
+            return _audit_schedule_capabilities(doc, payload)
+        except Exception as e:
+            route_logger.error("Error in /schedules/audit_capabilities: {}".format(e), exc_info=True)
+            return routes.Response(
+                status=500,
+                data=sanitize_for_json({
+                    "status": "error",
+                    "error": "Internal server error while auditing schedule capabilities.",
                     "details": str(e),
                 }),
             )
@@ -2044,6 +2500,7 @@ def register_routes(api):
                 return routes.Response(status=400, data=sanitize_for_json({"status": "error", "error": category_error}))
 
             fields = _as_list(payload.get("fields"))
+            calculated_fields = _as_list(payload.get("calculated_fields") or payload.get("add_calculated_fields"))
             filters = _as_list(payload.get("filters"))
             sort_fields = _as_list(payload.get("sort_fields") or payload.get("sort_group_fields"))
             settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else {}
@@ -2077,6 +2534,13 @@ def register_routes(api):
                     raise Exception(field_error)
                 added_fields.append(summary)
 
+            added_calculated_fields = []
+            for field_spec in calculated_fields:
+                field, summary, field_error = _add_calculated_schedule_field(definition, doc, field_spec)
+                if field_error:
+                    raise Exception(field_error)
+                added_calculated_fields.append(summary)
+
             applied_settings = _apply_definition_settings(definition, settings)
 
             added_filters = []
@@ -2102,6 +2566,7 @@ def register_routes(api):
                 "schedule": _schedule_details(schedule, doc, include_available_fields=False),
                 "schedule_kind": "material_takeoff" if is_material_takeoff else "schedule",
                 "added_fields": added_fields,
+                "added_calculated_fields": added_calculated_fields,
                 "added_filters": added_filters,
                 "added_sort_group_fields": added_sort_fields,
                 "applied_settings": applied_settings,
@@ -2141,6 +2606,7 @@ def register_routes(api):
             changes = {
                 "renamed": False,
                 "added_fields": [],
+                "added_calculated_fields": [],
                 "removed_fields": [],
                 "removed_filter_indexes": [],
                 "added_filters": [],
@@ -2169,6 +2635,12 @@ def register_routes(api):
                 if field_error:
                     raise Exception(field_error)
                 changes["added_fields"].append(summary)
+
+            for field_spec in _as_list(payload.get("add_calculated_fields") or payload.get("calculated_fields")):
+                field, summary, field_error = _add_calculated_schedule_field(definition, doc, field_spec)
+                if field_error:
+                    raise Exception(field_error)
+                changes["added_calculated_fields"].append(summary)
 
             for field_spec in _as_list(payload.get("remove_fields")):
                 field, summary, field_error = _find_schedule_field(definition, doc, field_spec)

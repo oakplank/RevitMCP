@@ -11,6 +11,7 @@ DUPLICATE_SCHEDULE_TOOL_NAME = "duplicate_schedule"
 DELETE_SCHEDULE_TOOL_NAME = "delete_schedule"
 CREATE_SCHEDULE_TOOL_NAME = "create_schedule"
 UPDATE_SCHEDULE_TOOL_NAME = "update_schedule"
+AUDIT_SCHEDULE_CAPABILITIES_TOOL_NAME = "audit_schedule_capabilities"
 
 
 def _schedule_identifier_payload(schedule_id: str = None, schedule_name: str = None, exact_match: bool = False) -> dict:
@@ -342,6 +343,7 @@ def create_schedule_handler(
     schedule_kind: str = None,
     is_material_takeoff: bool = False,
     fields: list = None,
+    calculated_fields: list = None,
     filters: list = None,
     sort_fields: list = None,
     settings: dict = None,
@@ -357,6 +359,7 @@ def create_schedule_handler(
         "schedule_name": schedule_name,
         "uniquify_name": bool(uniquify_name),
         "fields": fields or [],
+        "calculated_fields": calculated_fields or [],
         "filters": filters or [],
         "sort_fields": sort_fields or [],
         "settings": settings or {},
@@ -380,7 +383,15 @@ def create_schedule_handler(
     result = _call_schedule_route(services, "/schedules/create", payload)
     return services.result_store.compact_result_payload(
         result,
-        preserve_keys=["status", "message", "schedule", "added_fields", "added_filters", "added_sort_group_fields"],
+        preserve_keys=[
+            "status",
+            "message",
+            "schedule",
+            "added_fields",
+            "added_calculated_fields",
+            "added_filters",
+            "added_sort_group_fields",
+        ],
     )
 
 
@@ -391,6 +402,8 @@ def update_schedule_handler(
     exact_match: bool = False,
     new_name: str = None,
     add_fields: list = None,
+    add_calculated_fields: list = None,
+    calculated_fields: list = None,
     remove_fields: list = None,
     filters: list = None,
     add_filters: list = None,
@@ -417,6 +430,7 @@ def update_schedule_handler(
     operations = {
         "new_name": new_name,
         "add_fields": add_fields,
+        "add_calculated_fields": add_calculated_fields or calculated_fields,
         "remove_fields": remove_fields,
         "filters": filters,
         "add_filters": add_filters,
@@ -459,6 +473,77 @@ def update_schedule_handler(
     return services.result_store.compact_result_payload(
         result,
         preserve_keys=["status", "message", "schedule", "changes", "matching_schedules"],
+    )
+
+
+def audit_schedule_capabilities_handler(
+    services,
+    category_name: str = None,
+    category_id: str = None,
+    schedule_kind: str = None,
+    is_material_takeoff: bool = False,
+    fields: list = None,
+    field_name_contains: str = None,
+    filter_operators: list = None,
+    max_fields: int = 24,
+    max_filter_tests: int = 120,
+    include_filter_tests: bool = True,
+    include_sort_tests: bool = True,
+    include_settings_tests: bool = True,
+    include_row_read: bool = True,
+    **_kwargs,
+) -> dict:
+    if not category_name and not category_id:
+        return {"status": "error", "message": "Provide category_name or category_id."}
+
+    payload = {
+        "fields": fields or [],
+        "max_fields": bounded_int(max_fields, 24, min_value=1, max_value=250),
+        "max_filter_tests": bounded_int(max_filter_tests, 120, min_value=0, max_value=1000),
+        "include_filter_tests": bool(include_filter_tests),
+        "include_sort_tests": bool(include_sort_tests),
+        "include_settings_tests": bool(include_settings_tests),
+        "include_row_read": bool(include_row_read),
+    }
+    if category_name:
+        payload["category_name"] = category_name
+    if category_id:
+        payload["category_id"] = str(category_id)
+    if schedule_kind:
+        payload["schedule_kind"] = schedule_kind
+    if is_material_takeoff:
+        payload["is_material_takeoff"] = True
+    if field_name_contains:
+        payload["field_name_contains"] = field_name_contains
+    if filter_operators:
+        payload["filter_operators"] = [str(operator) for operator in filter_operators]
+
+    services.logger.info(
+        "MCP Tool executed: %s with category_name=%s category_id=%s schedule_kind=%s",
+        AUDIT_SCHEDULE_CAPABILITIES_TOOL_NAME,
+        category_name,
+        category_id,
+        schedule_kind,
+    )
+    result = _call_schedule_route(services, "/schedules/audit_capabilities", payload)
+    return services.result_store.compact_result_payload(
+        result,
+        preserve_keys=[
+            "status",
+            "message",
+            "audit_mode",
+            "rolled_back",
+            "category",
+            "schedule_kind",
+            "can_create",
+            "summary",
+            "field_tests",
+            "filter_tests",
+            "sort_tests",
+            "settings_tests",
+            "row_read_test",
+            "limitations",
+        ],
     )
 
 
@@ -544,6 +629,48 @@ def build_schedule_tools() -> list[ToolDefinition]:
             "show_footer_title": {"type": "boolean"},
             "show_footer_count": {"type": "boolean"},
             "index": {"type": "integer", "description": "Existing sort/group index when updating sorting."},
+        },
+    }
+    calculated_field_schema = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Visible calculated field heading/name, e.g. DLO Width.",
+            },
+            "column_heading": {"type": "string", "description": "Optional explicit column heading."},
+            "kind": {
+                "type": "string",
+                "enum": ["formula", "percentage"],
+                "description": "Calculated field kind. Percentage fields are fully supported by Revit API; formula text assignment is not exposed in Revit 2024.",
+            },
+            "calculation_type": {
+                "type": "string",
+                "enum": ["formula", "percentage"],
+                "description": "Alias for kind.",
+            },
+            "field_type": {
+                "type": "string",
+                "enum": ["Formula", "Percentage", "formula", "percentage"],
+                "description": "Alias for kind.",
+            },
+            "formula": {
+                "type": "string",
+                "description": "Formula text. Revit 2024 API does not expose a public setter; supplying this returns an explicit unsupported error.",
+            },
+            "expression": {
+                "type": "string",
+                "description": "Alias for formula.",
+            },
+            "percentage_of": {
+                "description": "Field spec for the numeric field to calculate percentages of.",
+                **flexible_field_schema,
+            },
+            "percentage_by": {
+                "description": "Optional grouped field spec to calculate percentages within a group.",
+                **flexible_field_schema,
+            },
+            "hidden": {"type": "boolean", "description": "Whether the added calculated field should be hidden."},
         },
     }
     settings_schema = {
@@ -746,6 +873,7 @@ def build_schedule_tools() -> list[ToolDefinition]:
                         "description": "Alias for schedule_kind='material_takeoff'.",
                     },
                     "fields": {"type": "array", "items": flexible_field_schema},
+                    "calculated_fields": {"type": "array", "items": calculated_field_schema},
                     "filters": {"type": "array", "items": filter_schema},
                     "sort_fields": {"type": "array", "items": sort_schema},
                     "settings": settings_schema,
@@ -772,6 +900,12 @@ def build_schedule_tools() -> list[ToolDefinition]:
                     "exact_match": {"type": "boolean"},
                     "new_name": {"type": "string"},
                     "add_fields": {"type": "array", "items": flexible_field_schema},
+                    "add_calculated_fields": {"type": "array", "items": calculated_field_schema},
+                    "calculated_fields": {
+                        "type": "array",
+                        "items": calculated_field_schema,
+                        "description": "Alias for add_calculated_fields.",
+                    },
                     "remove_fields": {"type": "array", "items": flexible_field_schema},
                     "filters": {
                         "type": "array",
@@ -801,5 +935,54 @@ def build_schedule_tools() -> list[ToolDefinition]:
                 },
             },
             handler=update_schedule_handler,
+        ),
+        ToolDefinition(
+            name=AUDIT_SCHEDULE_CAPABILITIES_TOOL_NAME,
+            description=(
+                "Runs a rollback-only schedule capability probe for a category. Creates a temporary schedule inside "
+                "a Revit transaction, tests fields, filters, sort/group settings, schedule settings, optional row "
+                "reading, and rolls back so the model is left unchanged. Use before complex autonomous schedule "
+                "creation or updates."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "category_name": {"type": "string", "description": "Revit category name, e.g. Windows, Doors."},
+                    "category_id": {"type": "string", "description": "Category ElementId. Use when category name is ambiguous."},
+                    "schedule_kind": {
+                        "type": "string",
+                        "enum": ["schedule", "material_takeoff"],
+                        "description": "Use material_takeoff to probe material fields like Material: Mark and Material: Area.",
+                    },
+                    "is_material_takeoff": {"type": "boolean", "description": "Alias for schedule_kind='material_takeoff'."},
+                    "fields": {
+                        "type": "array",
+                        "items": flexible_field_schema,
+                        "description": "Optional target fields to probe. If omitted, representative available fields are tested.",
+                    },
+                    "field_name_contains": {
+                        "type": "string",
+                        "description": "Optional case-insensitive substring used to choose available fields to test.",
+                    },
+                    "filter_operators": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": filter_schema["properties"]["operator"]["enum"]},
+                        "description": "Optional filter operators to probe. Defaults to representative string, numeric, and value-presence operators.",
+                    },
+                    "max_fields": {
+                        "type": "integer",
+                        "description": "Maximum fields to test when fields is omitted. Default 24, max 250.",
+                    },
+                    "max_filter_tests": {
+                        "type": "integer",
+                        "description": "Maximum field/operator filter combinations to test. Default 120, max 1000.",
+                    },
+                    "include_filter_tests": {"type": "boolean", "description": "Default true."},
+                    "include_sort_tests": {"type": "boolean", "description": "Default true."},
+                    "include_settings_tests": {"type": "boolean", "description": "Default true."},
+                    "include_row_read": {"type": "boolean", "description": "Default true."},
+                },
+            },
+            handler=audit_schedule_capabilities_handler,
         ),
     ]
