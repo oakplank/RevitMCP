@@ -56,6 +56,7 @@ from RevitMCP_ExternalServer.tools.element_operation_tools import (
 from RevitMCP_ExternalServer.tools.model_tools import analyze_model_statistics_handler
 from RevitMCP_ExternalServer.tools.registry import ToolDefinition, ToolRegistry, build_tool_registry
 from RevitMCP_ExternalServer.tools.schedule_tools import (
+    audit_schedule_capabilities_handler,
     compare_schedules_handler,
     create_schedule_handler,
     delete_schedule_handler,
@@ -67,8 +68,11 @@ from RevitMCP_ExternalServer.tools.schedule_tools import (
 )
 from RevitMCP_ExternalServer.tools.view_tools import (
     activate_view_handler,
+    clear_temporary_isolate_handler,
     duplicate_view_handler,
     export_active_view_image_handler,
+    export_element_snapshot_handler,
+    isolate_elements_in_view_handler,
 )
 from RevitMCP_ExternalServer.web.chat_service import run_chat_request
 from RevitMCP_UI import ui_manager
@@ -139,6 +143,9 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("delete_elements", definition_map)
         self.assertIn("activate_view", definition_map)
         self.assertIn("export_active_view_image", definition_map)
+        self.assertIn("export_element_snapshot", definition_map)
+        self.assertIn("isolate_elements_in_view", definition_map)
+        self.assertIn("clear_temporary_isolate", definition_map)
         self.assertIn("duplicate_view", definition_map)
         self.assertIn("list_schedules", definition_map)
         self.assertIn("get_schedule_info", definition_map)
@@ -149,6 +156,7 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("delete_schedule", definition_map)
         self.assertIn("create_schedule", definition_map)
         self.assertIn("update_schedule", definition_map)
+        self.assertIn("audit_schedule_capabilities", definition_map)
 
     def test_dispatch_known_and_unknown_tool(self):
         app, _mcp_server, services, registry = create_application(
@@ -514,8 +522,36 @@ class ScheduleToolTests(unittest.TestCase):
         self.assertEqual(calls[0][2]["schedule_name"], "Door Hardware")
         self.assertEqual(calls[0][2]["category_name"], "Doors")
         self.assertEqual(calls[0][2]["fields"][0], "Mark")
+        self.assertEqual(calls[0][2]["calculated_fields"], [])
         self.assertEqual(calls[0][2]["filters"][0]["operator"], "contains")
         self.assertTrue(calls[0][2]["settings"]["is_itemized"])
+
+    def test_create_schedule_posts_calculated_fields_payload(self):
+        services, calls = self.make_services(
+            {
+                "status": "success",
+                "added_calculated_fields": [{"name": "Pct Area"}],
+            }
+        )
+
+        result = create_schedule_handler(
+            services,
+            schedule_name="Area Mix",
+            category_name="Rooms",
+            fields=[{"name": "Area"}],
+            calculated_fields=[
+                {
+                    "name": "Pct Area",
+                    "kind": "percentage",
+                    "percentage_of": {"name": "Area"},
+                }
+            ],
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/schedules/create")
+        self.assertEqual(calls[0][2]["calculated_fields"][0]["kind"], "percentage")
+        self.assertEqual(calls[0][2]["calculated_fields"][0]["percentage_of"]["name"], "Area")
 
     def test_create_schedule_allows_available_field_index_selectors(self):
         services, calls = self.make_services({"status": "success"})
@@ -663,6 +699,63 @@ class ScheduleToolTests(unittest.TestCase):
         self.assertTrue(calls[0][2]["replace_filters"])
         self.assertEqual(calls[0][2]["filters"][0]["field_name"], "Comments")
 
+    def test_update_schedule_posts_calculated_fields_payload(self):
+        services, calls = self.make_services({"status": "success", "changes": {"added_calculated_fields": []}})
+
+        result = update_schedule_handler(
+            services,
+            schedule_id="99",
+            add_calculated_fields=[
+                {
+                    "name": "Pct Area",
+                    "kind": "percentage",
+                    "percentage_of": {"name": "Area"},
+                }
+            ],
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/schedules/update")
+        self.assertEqual(calls[0][2]["add_calculated_fields"][0]["name"], "Pct Area")
+
+    def test_audit_schedule_capabilities_posts_probe_payload(self):
+        services, calls = self.make_services(
+            {
+                "status": "success",
+                "audit_mode": "rollback_transaction",
+                "rolled_back": True,
+            }
+        )
+
+        result = audit_schedule_capabilities_handler(
+            services,
+            category_name="Windows",
+            schedule_kind="material_takeoff",
+            fields=[{"available_field_index": 97}],
+            filter_operators=["contains"],
+            max_fields=500,
+            max_filter_tests=5000,
+            include_sort_tests=False,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/schedules/audit_capabilities")
+        self.assertEqual(calls[0][2]["category_name"], "Windows")
+        self.assertEqual(calls[0][2]["schedule_kind"], "material_takeoff")
+        self.assertEqual(calls[0][2]["fields"][0]["available_field_index"], 97)
+        self.assertEqual(calls[0][2]["filter_operators"], ["contains"])
+        self.assertEqual(calls[0][2]["max_fields"], 250)
+        self.assertEqual(calls[0][2]["max_filter_tests"], 1000)
+        self.assertFalse(calls[0][2]["include_sort_tests"])
+
+    def test_audit_schedule_capabilities_requires_category(self):
+        services, _calls = self.make_services()
+
+        result = audit_schedule_capabilities_handler(services)
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("category", result["message"])
+
 
 class ViewToolTests(unittest.TestCase):
     def test_export_active_view_image_posts_capture_payload(self):
@@ -696,6 +789,152 @@ class ViewToolTests(unittest.TestCase):
         self.assertEqual(calls[0][2]["capture_dir"], "C:\\captures")
         self.assertEqual(calls[0][2]["pixel_size"], 4096)
         self.assertEqual(calls[0][2]["format"], "jpeg")
+
+    def test_export_element_snapshot_posts_isolated_snapshot_payload(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "artifact_type": "image",
+                    "image_path": "C:\\captures\\element_snapshot.png",
+                    "mime_type": "image/png",
+                }
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(capture_base_dir="C:\\captures"),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = export_element_snapshot_handler(
+            services,
+            element_id="123",
+            view_id="456",
+            pixel_size=99999,
+            format="webp",
+            section_box_margin_mm=250,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/views/element_snapshot")
+        self.assertEqual(calls[0][1], "POST")
+        self.assertEqual(calls[0][2]["element_ids"], ["123"])
+        self.assertEqual(calls[0][2]["view_id"], "456")
+        self.assertEqual(calls[0][2]["capture_dir"], "C:\\captures")
+        self.assertEqual(calls[0][2]["pixel_size"], 4096)
+        self.assertEqual(calls[0][2]["format"], "png")
+        self.assertEqual(calls[0][2]["section_box_margin_mm"], 250)
+        self.assertTrue(calls[0][2]["isolate"])
+        self.assertTrue(calls[0][2]["use_section_box"])
+        self.assertTrue(calls[0][2]["hide_annotations"])
+
+    def test_export_element_snapshot_can_use_active_selection(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {"status": "success", "artifact_type": "image"}
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(capture_base_dir="C:\\captures"),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = export_element_snapshot_handler(
+            services,
+            use_active_selection=True,
+            view_id="456",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertNotIn("element_ids", calls[0][2])
+        self.assertTrue(calls[0][2]["use_active_selection"])
+        self.assertEqual(calls[0][2]["view_id"], "456")
+
+    def test_isolate_elements_in_view_posts_payload(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {"status": "success", "isolated_count": 2}
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = isolate_elements_in_view_handler(
+            services,
+            element_ids=["1", "2"],
+            view_id="456",
+            focus=True,
+            refresh_view=False,
+            clear_existing=True,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/views/active/isolate_elements")
+        self.assertEqual(calls[0][1], "POST")
+        self.assertEqual(calls[0][2]["element_ids"], ["1", "2"])
+        self.assertEqual(calls[0][2]["view_id"], "456")
+        self.assertTrue(calls[0][2]["focus"])
+        self.assertFalse(calls[0][2]["refresh_view"])
+        self.assertTrue(calls[0][2]["clear_existing"])
+
+    def test_isolate_elements_in_view_can_use_active_selection(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {"status": "success", "isolated_count": 1}
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = isolate_elements_in_view_handler(
+            services,
+            use_active_selection=True,
+            view_id="456",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertNotIn("element_ids", calls[0][2])
+        self.assertTrue(calls[0][2]["use_active_selection"])
+        self.assertEqual(calls[0][2]["view_id"], "456")
+
+    def test_clear_temporary_isolate_posts_payload(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {"status": "success"}
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = clear_temporary_isolate_handler(
+            services,
+            view_id="456",
+            refresh_view=False,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0][0], "/views/active/clear_temporary_isolate")
+        self.assertEqual(calls[0][1], "POST")
+        self.assertEqual(calls[0][2]["view_id"], "456")
+        self.assertFalse(calls[0][2]["refresh_view"])
 
     def test_activate_view_posts_activate_route_payload(self):
         calls = []
