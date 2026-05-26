@@ -9,6 +9,9 @@ from RevitMCP_ExternalServer.tools.registry import ToolDefinition
 GET_ACTIVE_VIEW_INFO_TOOL_NAME = "get_active_view_info"
 GET_ACTIVE_VIEW_ELEMENTS_TOOL_NAME = "get_active_view_elements"
 EXPORT_ACTIVE_VIEW_IMAGE_TOOL_NAME = "export_active_view_image"
+EXPORT_ELEMENT_SNAPSHOT_TOOL_NAME = "export_element_snapshot"
+ISOLATE_ELEMENTS_IN_VIEW_TOOL_NAME = "isolate_elements_in_view"
+CLEAR_TEMPORARY_ISOLATE_TOOL_NAME = "clear_temporary_isolate"
 PLACE_VIEW_ON_SHEET_TOOL_NAME = "place_view_on_sheet"
 ACTIVATE_VIEW_TOOL_NAME = "activate_view"
 DUPLICATE_VIEW_TOOL_NAME = "duplicate_view"
@@ -168,6 +171,152 @@ def export_active_view_image_handler(
             "pixel_size": safe_pixel_size,
             "format": normalized_format,
         },
+    )
+
+
+def export_element_snapshot_handler(
+    services,
+    element_ids: list[str] = None,
+    element_id: str = None,
+    use_active_selection: bool = False,
+    view_id: str = None,
+    view_name: str = None,
+    exact_match: bool = False,
+    pixel_size: int = 1600,
+    format: str = "png",
+    section_box_margin_mm: int = 300,
+    isolate: bool = True,
+    use_section_box: bool = True,
+    hide_annotations: bool = True,
+    **_kwargs,
+) -> dict:
+    resolved_ids = []
+    if element_ids:
+        resolved_ids = [str(value) for value in element_ids]
+    elif element_id:
+        resolved_ids = [str(element_id)]
+
+    if not resolved_ids and not use_active_selection:
+        return {"status": "error", "message": "Provide element_id or element_ids."}
+
+    safe_pixel_size = bounded_int(pixel_size, 1600, min_value=256, max_value=4096)
+    safe_margin = bounded_int(section_box_margin_mm, 300, min_value=0, max_value=10000)
+    normalized_format = str(format or "png").strip().lower()
+    if normalized_format not in ("png", "jpg", "jpeg", "bmp", "tif", "tiff"):
+        normalized_format = "png"
+
+    payload = {
+        "capture_dir": services.config.capture_base_dir,
+        "pixel_size": safe_pixel_size,
+        "format": normalized_format,
+        "section_box_margin_mm": safe_margin,
+        "isolate": bool(isolate),
+        "use_section_box": bool(use_section_box),
+        "hide_annotations": bool(hide_annotations),
+        "use_active_selection": bool(use_active_selection),
+        "exact_match": bool(exact_match),
+    }
+    if resolved_ids:
+        payload["element_ids"] = resolved_ids
+    if view_id:
+        payload["view_id"] = str(view_id)
+    if view_name:
+        payload["view_name"] = view_name
+
+    services.logger.info(
+        "MCP Tool executed: %s with %s element(s), view_id=%s, pixel_size=%s",
+        EXPORT_ELEMENT_SNAPSHOT_TOOL_NAME,
+        len(resolved_ids),
+        view_id,
+        safe_pixel_size,
+    )
+
+    return services.revit_client.call_listener(
+        command_path="/views/element_snapshot",
+        method="POST",
+        payload_data=payload,
+    )
+
+
+def isolate_elements_in_view_handler(
+    services,
+    element_ids: list[str] = None,
+    element_id: str = None,
+    use_active_selection: bool = False,
+    view_id: str = None,
+    view_name: str = None,
+    exact_match: bool = False,
+    focus: bool = True,
+    refresh_view: bool = True,
+    clear_existing: bool = True,
+    **_kwargs,
+) -> dict:
+    resolved_ids = []
+    if element_ids:
+        resolved_ids = [str(value) for value in element_ids]
+    elif element_id:
+        resolved_ids = [str(element_id)]
+
+    if not resolved_ids and not use_active_selection:
+        return {"status": "error", "message": "Provide element_id/element_ids, or set use_active_selection=true."}
+
+    payload = {
+        "use_active_selection": bool(use_active_selection),
+        "exact_match": bool(exact_match),
+        "focus": bool(focus),
+        "refresh_view": bool(refresh_view),
+        "clear_existing": bool(clear_existing),
+    }
+    if resolved_ids:
+        payload["element_ids"] = resolved_ids
+    if view_id:
+        payload["view_id"] = str(view_id)
+    if view_name:
+        payload["view_name"] = view_name
+
+    services.logger.info(
+        "MCP Tool executed: %s with %s explicit element(s), active_selection=%s, view_id=%s",
+        ISOLATE_ELEMENTS_IN_VIEW_TOOL_NAME,
+        len(resolved_ids),
+        bool(use_active_selection),
+        view_id,
+    )
+
+    return services.revit_client.call_listener(
+        command_path="/views/active/isolate_elements",
+        method="POST",
+        payload_data=payload,
+    )
+
+
+def clear_temporary_isolate_handler(
+    services,
+    view_id: str = None,
+    view_name: str = None,
+    exact_match: bool = False,
+    refresh_view: bool = True,
+    **_kwargs,
+) -> dict:
+    payload = {
+        "exact_match": bool(exact_match),
+        "refresh_view": bool(refresh_view),
+    }
+    if view_id:
+        payload["view_id"] = str(view_id)
+    if view_name:
+        payload["view_name"] = view_name
+
+    services.logger.info(
+        "MCP Tool executed: %s with view_id=%s, view_name=%s",
+        CLEAR_TEMPORARY_ISOLATE_TOOL_NAME,
+        view_id,
+        view_name,
+    )
+
+    return services.revit_client.call_listener(
+        command_path="/views/active/clear_temporary_isolate",
+        method="POST",
+        payload_data=payload,
     )
 
 
@@ -607,6 +756,149 @@ def build_view_tools() -> list[ToolDefinition]:
                 },
             },
             handler=export_active_view_image_handler,
+        ),
+        ToolDefinition(
+            name=EXPORT_ELEMENT_SNAPSHOT_TOOL_NAME,
+            description=(
+                "Exports a focused snapshot of one or more elements from a model view. It can activate a target view, "
+                "temporarily isolate the elements, apply a tight section box in 3D views, export an image, then restore "
+                "the view state."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_id": {
+                        "type": "string",
+                        "description": "Single Revit element ID to isolate and snapshot.",
+                    },
+                    "element_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "One or more Revit element IDs to isolate and snapshot.",
+                    },
+                    "use_active_selection": {
+                        "type": "boolean",
+                        "description": "When true and no IDs are supplied, snapshot the current Revit UI selection.",
+                    },
+                    "view_id": {
+                        "type": "string",
+                        "description": "Optional view ID to activate before exporting. Preferred when names are ambiguous.",
+                    },
+                    "view_name": {
+                        "type": "string",
+                        "description": "Optional view name or partial name to activate before exporting.",
+                    },
+                    "exact_match": {
+                        "type": "boolean",
+                        "description": "Whether view_name must match exactly. Default false.",
+                    },
+                    "pixel_size": {
+                        "type": "integer",
+                        "description": "Target export pixel size. Default 1600, min 256, max 4096.",
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
+                        "description": "Image format. Default png.",
+                    },
+                    "section_box_margin_mm": {
+                        "type": "integer",
+                        "description": "Padding around isolated elements in millimeters. Default 300.",
+                    },
+                    "isolate": {
+                        "type": "boolean",
+                        "description": "Whether to use temporary hide/isolate. Default true.",
+                    },
+                    "use_section_box": {
+                        "type": "boolean",
+                        "description": "Whether to tighten the 3D section box around the elements when exporting a 3D view. Default true.",
+                    },
+                    "hide_annotations": {
+                        "type": "boolean",
+                        "description": "Whether to hide annotation/datum graphics while exporting. Default true.",
+                    },
+                },
+            },
+            handler=export_element_snapshot_handler,
+        ),
+        ToolDefinition(
+            name=ISOLATE_ELEMENTS_IN_VIEW_TOOL_NAME,
+            description=(
+                "Temporarily isolates explicit elements or the current Revit selection in the active or target view, "
+                "optionally focuses the view on them, and leaves the isolation active for inspection."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_id": {
+                        "type": "string",
+                        "description": "Single Revit element ID to isolate.",
+                    },
+                    "element_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "One or more Revit element IDs to isolate.",
+                    },
+                    "use_active_selection": {
+                        "type": "boolean",
+                        "description": "When true and no IDs are supplied, isolate the current Revit UI selection.",
+                    },
+                    "view_id": {
+                        "type": "string",
+                        "description": "Optional view ID to activate before isolating. Use a 3D view for object inspection.",
+                    },
+                    "view_name": {
+                        "type": "string",
+                        "description": "Optional view name or partial name to activate before isolating.",
+                    },
+                    "exact_match": {
+                        "type": "boolean",
+                        "description": "Whether view_name must match exactly. Default false.",
+                    },
+                    "focus": {
+                        "type": "boolean",
+                        "description": "Whether to select and ShowElements after isolating. Default true.",
+                    },
+                    "refresh_view": {
+                        "type": "boolean",
+                        "description": "Whether to refresh the active view after isolating. Default true.",
+                    },
+                    "clear_existing": {
+                        "type": "boolean",
+                        "description": "Whether to clear any existing temporary hide/isolate before applying the new isolate. Default true.",
+                    },
+                },
+            },
+            handler=isolate_elements_in_view_handler,
+        ),
+        ToolDefinition(
+            name=CLEAR_TEMPORARY_ISOLATE_TOOL_NAME,
+            description=(
+                "Clears temporary hide/isolate in the active or target view. Use after isolate_elements_in_view "
+                "when the view should return to normal."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "view_id": {
+                        "type": "string",
+                        "description": "Optional view ID to activate before clearing temporary hide/isolate.",
+                    },
+                    "view_name": {
+                        "type": "string",
+                        "description": "Optional view name or partial name to activate before clearing.",
+                    },
+                    "exact_match": {
+                        "type": "boolean",
+                        "description": "Whether view_name must match exactly. Default false.",
+                    },
+                    "refresh_view": {
+                        "type": "boolean",
+                        "description": "Whether to refresh the active view after clearing. Default true.",
+                    },
+                },
+            },
+            handler=clear_temporary_isolate_handler,
         ),
         ToolDefinition(
             name=PLACE_VIEW_ON_SHEET_TOOL_NAME,
