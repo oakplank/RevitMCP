@@ -5,13 +5,13 @@ RevitMCP is a pyRevit extension plus a Python server that lets AI clients work a
 It supports two ways to use it:
 
 *   Web UI at `http://127.0.0.1:8000`
-*   Claude Desktop local MCP over stdio
+*   Local MCP over stdio for clients such as Claude Desktop, Claude Code, and Codex
 
 Repository layout note: this repository root is the pyRevit extension root. If you install from source manually, the checkout directory itself should be named `RevitMCP.extension`.
 
 ## Tools
 
-RevitMCP exposes 29 tools:
+RevitMCP exposes 44 tools:
 
 | Tool | Description |
 | --- | --- |
@@ -19,6 +19,9 @@ RevitMCP exposes 29 tools:
 | `get_active_view_info` | Read the current view's name, type, scale, and related metadata |
 | `get_active_view_elements` | Capture a bounded snapshot of elements visible in the active view |
 | `export_active_view_image` | Export the active Revit view to a local image artifact for model vision inspection |
+| `export_element_snapshot` | Export a focused snapshot from explicit IDs or the active selection by activating a target view, temporarily isolating elements, tightening a section box when exporting 3D views, exporting, and restoring the view |
+| `isolate_elements_in_view` | Temporarily isolate explicit elements or the active selection in a view and optionally focus the camera for inspection |
+| `clear_temporary_isolate` | Clear temporary hide/isolate in the active or target view |
 | `activate_view` | Switch the active Revit view by view ID or view name |
 | `duplicate_view` | Duplicate a view, optionally with detailing/as dependent, template assignment, and activation |
 | `get_active_selection` | Read the current Revit selection as a reusable result set |
@@ -36,6 +39,8 @@ RevitMCP exposes 29 tools:
 | `filter_elements` | Find elements by category, level, and parameter-based conditions |
 | `filter_stored_elements_by_parameter` | Refine a stored result set with batched server-side parameter filtering using one or many target values |
 | `get_element_properties` | Read parameter values for specific elements or an existing result handle |
+| `get_element_relationships` | Read host, parent, child, dependent, and adaptive point relationships for model elements |
+| `get_related_element_properties` | Read selected parameters from elements and their host/super-component chains |
 | `update_element_parameters` | Update one or many element parameters with typed value handling |
 | `override_element_graphics` | Apply or reset active-view graphic overrides for explicit IDs or stored result sets |
 | `delete_elements` | Delete elements with dry-run, confirmation, max-count, unpin, and batch/individual safeguards |
@@ -43,13 +48,25 @@ RevitMCP exposes 29 tools:
 | `list_views` | List views that can be placed on sheets, including type and placement status |
 | `analyze_view_naming_patterns` | Cluster view names by type and flag likely naming outliers |
 | `suggest_view_name_corrections` | Generate rename suggestions from a prior view naming analysis |
+| `list_schedules` | List Revit schedules with IDs, categories, field counts, filters, sorting, and sheet placement status |
+| `get_schedule_info` | Read a schedule definition including fields, hidden state, filters, sorting/grouping, and settings |
+| `list_schedule_available_fields` | List fields/parameters that can be added to a schedule, including stable available field indexes |
+| `get_schedule_rows` | Read visible schedule table rows and column metadata |
+| `compare_schedules` | Compare schedule rows across overall/release schedules by key fields and quantity fields |
+| `duplicate_schedule` | Duplicate a schedule and optionally rename it |
+| `delete_schedule` | Delete a schedule with dry-run and confirmation safeguards |
+| `create_schedule` | Create a schedule or material takeoff with fields, calculated percentage fields, filters, sorting, and settings |
+| `update_schedule` | Update schedule fields, calculated percentage fields, filters, sorting/grouping, settings, or name |
+| `audit_schedule_capabilities` | Run a rollback-only probe for schedule creation, fields, filters, sorting, settings, and row reads |
 | `plan_and_execute_workflow` | Execute a multi-step Revit workflow from a structured tool plan |
+
+Schedule calculated field support currently maps to the public Revit 2024 API. Percentage fields can be added and wired to schedule fields through `calculated_fields` / `add_calculated_fields`. Revit exposes `ScheduleFieldType.Formula`, but does not expose a public formula-string setter in this API version, so formula text is rejected with an explicit unsupported error instead of silently creating a broken field.
 
 ## Requirements
 
 *   Autodesk Revit
 *   pyRevit
-*   Python 3.7+ available as `python` if you want to run the external server directly or through Claude Desktop. Python 3.13 or older is recommended because some current AI-provider dependencies warn under Python 3.14+.
+*   Python 3.7+ available as `python` if you want to run the external server directly or through a local MCP client. Python 3.13 or older is recommended because some current AI-provider dependencies warn under Python 3.14+.
 *   A Revit project open while using RevitMCP
 
 ## Surface Modes
@@ -57,7 +74,7 @@ RevitMCP exposes 29 tools:
 RevitMCP has two server surfaces:
 
 *   `web`: browser UI at `http://127.0.0.1:8000`
-*   `mcp`: stdio server for Claude Desktop
+*   `mcp`: stdio server for local MCP clients such as Claude Desktop, Claude Code, and Codex
 
 One `server.py` process runs one surface at a time.
 
@@ -80,7 +97,7 @@ If you use the pyRevit launcher, it reads the preferred surface from:
 }
 ```
 
-If you want both the Web UI and Claude Desktop at the same time, they need to run as separate processes.
+If you want both the Web UI and an MCP client at the same time, they need to run as separate processes.
 
 ## Install RevitMCP
 
@@ -99,7 +116,7 @@ git clone https://github.com/oakplank/RevitMCP.git "%APPDATA%\pyRevit\Extensions
 
 The folder name matters: pyRevit discovers extensions by folders that end with `.extension`.
 
-Keep track of the exact `RevitMCP.extension` folder you install here. Claude Desktop must point to the `server.py` file inside this same folder. Do not point Claude at the pyRevit install folder unless that is actually where this extension is installed.
+Keep track of the exact `RevitMCP.extension` folder you install here. Local MCP clients must point to the `server.py` file inside this same folder. Do not point your client at the pyRevit install folder unless that is actually where this extension is installed.
 
 ## Enable Revit Routes
 
@@ -227,6 +244,50 @@ Expected Claude Desktop screen after `revitmcp` is configured:
 
 ![Claude Desktop Local MCP settings showing Developer selected and the revitmcp server running](docs/images/claude-local-mcp-settings.png)
 
+## Quick Start: Codex
+
+Codex local MCP is local to one machine. Use this on the same computer that has Revit open, pyRevit installed, and the `RevitMCP.extension` files available. Existing Codex sessions may not hot-load new MCP servers, so restart Codex after adding the server.
+
+1.  Install or update Codex.
+2.  Find the exact `server.py` path inside the same `RevitMCP.extension` folder that pyRevit loads.
+
+If you installed under your user extension root:
+
+```powershell
+$server = "$env:APPDATA\pyRevit\Extensions\RevitMCP.extension\lib\RevitMCP_ExternalServer\server.py"
+Test-Path $server
+$server
+```
+
+If you installed under the machine-wide extension root:
+
+```powershell
+$server = "$env:PROGRAMDATA\pyRevit\Extensions\RevitMCP.extension\lib\RevitMCP_ExternalServer\server.py"
+Test-Path $server
+$server
+```
+
+`Test-Path` must return `True`.
+
+3.  Add `revitmcp` to Codex:
+
+```powershell
+codex mcp add revitmcp -- python $server --surface mcp
+```
+
+If `python` does not work, replace it with the full path to `python.exe`.
+
+The command writes a Codex MCP entry equivalent to:
+
+```toml
+[mcp_servers.revitmcp]
+command = "python"
+args = ['C:\Users\YourName\AppData\Roaming\pyRevit\Extensions\RevitMCP.extension\lib\RevitMCP_ExternalServer\server.py', "--surface", "mcp"]
+```
+
+4.  Restart Codex.
+5.  Start a new Codex session and try: `Get Revit project info`
+
 ## Troubleshooting
 
 ### `revitmcp` does not show in Claude Desktop
@@ -248,13 +309,27 @@ Get-ChildItem "$env:PROGRAMDATA\pyRevit\Extensions" -Directory
 
 If both `Test-Path` commands return `False`, either install/copy the extension to one of those `RevitMCP.extension` folders or update the Claude config to the real absolute path of `server.py` in the extension folder pyRevit is actually loading.
 
-### Claude Desktop can see `revitmcp` but tools do not work
+### `revitmcp` does not show in Codex
+
+*   Run `codex mcp list` and confirm `revitmcp` is listed.
+*   Make sure the `server.py` path is absolute and exists.
+*   If `python` is not found, use the full path to `python.exe`.
+*   Restart Codex after changing MCP config.
+
+If the server was added with the wrong path, remove and re-add it:
+
+```powershell
+codex mcp remove revitmcp
+codex mcp add revitmcp -- python C:\Users\YourName\AppData\Roaming\pyRevit\Extensions\RevitMCP.extension\lib\RevitMCP_ExternalServer\server.py --surface mcp
+```
+
+### Claude Desktop or Codex can see `revitmcp` but tools do not work
 
 *   Make sure Revit is open with a project loaded.
 *   Make sure pyRevit Routes is enabled.
 *   Restart Revit after enabling Routes.
-*   Open `View Logs` for `revitmcp` in Claude Desktop.
-*   Make sure Claude Desktop is running on the same machine as Revit. This MCP mode connects to the local Revit Routes server.
+*   Open `View Logs` for `revitmcp` in Claude Desktop, or check the Codex MCP startup output.
+*   Make sure the MCP client is running on the same machine as Revit. This MCP mode connects to the local Revit Routes server.
 
 ### Web UI or server startup issues
 
