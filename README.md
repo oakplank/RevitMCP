@@ -343,3 +343,10 @@ codex mcp add revitmcp -- python C:\Users\YourName\AppData\Roaming\pyRevit\Exten
 *   The coworker should use `http://<Revit computer IPv4>:8000`, not `http://127.0.0.1:8000`.
 *   If Windows prompts for firewall access when the server starts, allow private networks.
 *   If the terminal only shows a Python 3.14 Pydantic warning and never prints `Running on ...`, install Python 3.13 or older and configure RevitMCP to use that interpreter.
+
+## License
+
+RevitMCP is licensed under the MIT License. See [LICENSE.md](LICENSE.md).
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before submitting patches or pull
+requests.
