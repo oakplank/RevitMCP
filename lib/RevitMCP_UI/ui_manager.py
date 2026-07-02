@@ -13,6 +13,7 @@ import sys
 import json
 import tempfile
 import datetime
+import time
 
 # --- Configuration ---
 
@@ -445,7 +446,7 @@ def start_external_server():
             print(success_msg)
             show_alert(success_msg)
 
-        except FileNotFoundError:
+        except OSError:
             error_msg = "Error: The Python executable '{}' was not found. This should not happen if find_cpython_executable worked.".format(python_exe_to_use)
             print("[UI_MANAGER] {}".format(error_msg))
             show_alert(error_msg, title="RevitMCP Error")
@@ -467,12 +468,14 @@ def stop_external_server():
     if SERVER_PROCESS and SERVER_PROCESS.poll() is None:
         print("Stopping RevitMCP External Server...")
         SERVER_PROCESS.terminate()
-        try:
-            SERVER_PROCESS.wait(timeout=5)
+        deadline = time.time() + 5
+        while SERVER_PROCESS.poll() is None and time.time() < deadline:
+            time.sleep(0.25)
+        if SERVER_PROCESS.poll() is not None:
             stopped_msg = "RevitMCP External Server stopped."
             print(stopped_msg)
             show_alert(stopped_msg)
-        except subprocess.TimeoutExpired:
+        else:
             print("Server did not terminate in time, killing...")
             SERVER_PROCESS.kill()
             killed_msg = "RevitMCP External Server forcefully stopped."
