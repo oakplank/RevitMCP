@@ -6,6 +6,7 @@ from pyrevit import routes, script, DB
 from System.Collections.Generic import List
 
 from routes.json_safety import sanitize_for_json
+from routes.revit_compat import get_element_id_text, make_element_id
 
 
 try:
@@ -70,7 +71,7 @@ def _resolve_existing_element_ids(doc, raw_ids):
     missing_ids = []
 
     for element_id_value in element_id_values:
-        element_id = DB.ElementId(element_id_value)
+        element_id = make_element_id(DB, element_id_value)
         try:
             element = doc.GetElement(element_id)
         except Exception:
@@ -93,7 +94,7 @@ def _safe_element_name(element):
         pass
 
     try:
-        return str(element.Id.IntegerValue)
+        return get_element_id_text(element.Id) or ""
     except Exception:
         return ""
 
@@ -122,14 +123,14 @@ def _build_delete_candidate_summary(doc, element_id):
     group_id = None
     try:
         if element.GroupId and element.GroupId != DB.ElementId.InvalidElementId:
-            group_id = str(element.GroupId.IntegerValue)
+            group_id = get_element_id_text(element.GroupId)
     except Exception:
         group_id = None
 
     design_option_id = None
     try:
         if element.DesignOption and element.DesignOption.Id:
-            design_option_id = str(element.DesignOption.Id.IntegerValue)
+            design_option_id = get_element_id_text(element.DesignOption.Id)
     except Exception:
         design_option_id = None
 
@@ -137,7 +138,7 @@ def _build_delete_candidate_summary(doc, element_id):
     try:
         element_type_id = element.GetTypeId()
         if element_type_id and element_type_id != DB.ElementId.InvalidElementId:
-            type_id = str(element_type_id.IntegerValue)
+            type_id = get_element_id_text(element_type_id)
     except Exception:
         type_id = None
 
@@ -150,7 +151,7 @@ def _build_delete_candidate_summary(doc, element_id):
         warnings.append("Element is in a design option; active option/editability may affect deletion.")
 
     return {
-        "element_id": str(element_id.IntegerValue),
+        "element_id": get_element_id_text(element_id),
         "name": _safe_element_name(element),
         "category": category_name,
         "type_id": type_id,
@@ -326,10 +327,10 @@ def register_routes(api):
                 for element_id in existing_ids:
                     try:
                         active_view.SetElementOverrides(element_id, override_settings)
-                        applied_ids.append(str(element_id.IntegerValue))
+                        applied_ids.append(get_element_id_text(element_id))
                     except Exception as element_error:
                         failed.append({
-                            "element_id": str(element_id.IntegerValue),
+                            "element_id": get_element_id_text(element_id),
                             "error": str(element_error),
                         })
                 transaction.Commit()
@@ -364,7 +365,7 @@ def register_routes(api):
                     active_view.Name,
                 ),
                 "view": {
-                    "id": str(active_view.Id.IntegerValue),
+                    "id": get_element_id_text(active_view.Id),
                     "name": active_view.Name,
                     "type": str(active_view.ViewType),
                 },
@@ -495,7 +496,7 @@ def register_routes(api):
                                 try:
                                     if bool(element.Pinned):
                                         element.Pinned = False
-                                        unpinned_ids.append(str(element_id.IntegerValue))
+                                        unpinned_ids.append(get_element_id_text(element_id))
                                 except Exception:
                                     pass
                     deleted_ids = doc.Delete(existing_ids)
@@ -503,7 +504,7 @@ def register_routes(api):
                     deleted_input_ids = list(existing_values)
                     try:
                         for deleted_id in deleted_ids:
-                            deleted_values.append(str(deleted_id.IntegerValue))
+                            deleted_values.append(get_element_id_text(deleted_id))
                     except Exception:
                         deleted_values = []
                 except Exception as batch_error:
@@ -530,7 +531,7 @@ def register_routes(api):
                     )
             else:
                 for element_id in existing_ids:
-                    element_id_text = str(element_id.IntegerValue)
+                    element_id_text = get_element_id_text(element_id)
                     if not doc.GetElement(element_id):
                         skipped.append({
                             "element_id": element_id_text,
@@ -565,7 +566,7 @@ def register_routes(api):
                         deleted_input_ids.append(element_id_text)
                         try:
                             for deleted_id in deleted_ids:
-                                deleted_values.append(str(deleted_id.IntegerValue))
+                                deleted_values.append(get_element_id_text(deleted_id))
                         except Exception:
                             pass
                     except Exception as element_error:

@@ -47,6 +47,8 @@ try:
         sys.path.append(lib_dir)
         logger.info("Added lib directory to Python path: {}".format(lib_dir))
 
+    from routes.revit_compat import get_element_id_text
+
     @api.route('/diagnostics/revit_state', methods=['GET', 'POST'])
     def handle_get_revit_diagnostics(uiapp, uidoc, doc, request):
         """Always-on startup diagnostic route. Delegates to element_routes when available."""
@@ -66,7 +68,7 @@ try:
         try:
             if uidoc and uidoc.ActiveView:
                 active_view = {
-                    "id": str(uidoc.ActiveView.Id.IntegerValue),
+                    "id": get_element_id_text(uidoc.ActiveView.Id),
                     "name": _safe_name(uidoc.ActiveView.Name),
                     "view_type": _safe_name(uidoc.ActiveView.ViewType),
                 }
@@ -98,7 +100,7 @@ try:
                 for element_id in selected_ids:
                     if len(selection["element_ids"]) >= 10:
                         break
-                    selection["element_ids"].append(str(element_id.IntegerValue))
+                    selection["element_ids"].append(get_element_id_text(element_id))
         except Exception as selection_error:
             selection["error"] = str(selection_error)
 

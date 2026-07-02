@@ -4,6 +4,7 @@
 from pyrevit import routes, script, DB
 
 from routes.json_safety import sanitize_for_json, to_safe_ascii_text
+from routes.revit_compat import get_element_id_text, get_element_id_value, make_element_id
 
 
 try:
@@ -97,31 +98,16 @@ def _as_list(value):
 
 
 def _id_integer_value(element_id):
-    if element_id is None:
-        return None
-    for attr_name in ("IntegerValue", "Value"):
-        try:
-            return int(getattr(element_id, attr_name))
-        except Exception:
-            pass
-    try:
-        return int(str(element_id))
-    except Exception:
-        return None
+    return get_element_id_value(element_id)
 
 
 def _id_text(element_id):
-    value = _id_integer_value(element_id)
-    if value is not None:
-        return str(value)
-    if element_id is None:
-        return None
-    return _safe_text(element_id)
+    return get_element_id_text(element_id)
 
 
 def _new_element_id(value):
     try:
-        return DB.ElementId(int(str(value).strip()))
+        return make_element_id(DB, value)
     except Exception:
         return None
 

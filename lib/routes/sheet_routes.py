@@ -16,6 +16,7 @@ import glob
 from System.Collections.Generic import List
 
 from routes.json_safety import sanitize_for_json, to_safe_ascii_text
+from routes.revit_compat import get_element_id_text, make_element_id
 
 
 def _coerce_bool(value, default=False):
@@ -46,7 +47,7 @@ def _find_view_by_id(doc, view_id):
     if not view_id:
         return None
     try:
-        element_id = DB.ElementId(int(str(view_id).strip()))
+        element_id = make_element_id(DB, view_id)
         view = doc.GetElement(element_id)
         if isinstance(view, DB.View):
             return view
@@ -101,7 +102,7 @@ def _unique_view_name(doc, base_name):
 
 def _build_view_summary(view):
     return {
-        "id": str(view.Id.IntegerValue),
+        "id": get_element_id_text(view.Id),
         "name": to_safe_ascii_text(view.Name),
         "type": str(view.ViewType),
         "is_template": bool(getattr(view, "IsTemplate", False)),
@@ -210,7 +211,7 @@ def _build_section_box_for_elements(doc, view3d, element_ids, margin_feet):
             except Exception:
                 bbox = None
         if bbox is None:
-            missing_bbox_ids.append(str(element_id.IntegerValue))
+            missing_bbox_ids.append(get_element_id_text(element_id))
             continue
 
         for point in _bounding_box_corners(bbox):
@@ -320,7 +321,7 @@ def _resolve_payload_element_ids(uidoc, doc, payload, use_active_selection_defau
     )
     if raw_ids is None and use_active_selection:
         try:
-            raw_ids = [str(element_id.IntegerValue) for element_id in uidoc.Selection.GetElementIds()]
+            raw_ids = [get_element_id_text(element_id) for element_id in uidoc.Selection.GetElementIds()]
         except Exception:
             raw_ids = []
 
@@ -342,7 +343,7 @@ def _resolve_payload_element_ids(uidoc, doc, payload, use_active_selection_defau
 
     for raw_id in raw_ids:
         try:
-            element_id = DB.ElementId(int(str(raw_id).strip()))
+            element_id = make_element_id(DB, raw_id)
         except Exception:
             invalid_ids.append(str(raw_id))
             continue
@@ -655,7 +656,7 @@ def register_routes(api):
 
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             view_name_part = _safe_filename_component(active_view.Name)
-            prefix = "active_view_{}_{}_{}".format(timestamp, active_view.Id.IntegerValue, view_name_part)
+            prefix = "active_view_{}_{}_{}".format(timestamp, get_element_id_text(active_view.Id), view_name_part)
             file_prefix_path = os.path.join(capture_dir, prefix)
 
             before_files = _snapshot_capture_files(capture_dir)
@@ -824,7 +825,7 @@ def register_routes(api):
                     to_safe_ascii_text(active_view.Name),
                 ),
                 "view": _build_view_summary(active_view),
-                "element_ids": [str(element_id.IntegerValue) for element_id in element_ids],
+                "element_ids": [get_element_id_text(element_id) for element_id in element_ids],
                 "isolated_count": element_ids.Count,
                 "invalid_ids": invalid_ids,
                 "missing_ids": missing_ids,
@@ -944,7 +945,7 @@ def register_routes(api):
             use_active_selection = _coerce_bool(payload.get("use_active_selection"), default=raw_ids is None)
             if raw_ids is None and use_active_selection:
                 try:
-                    raw_ids = [str(element_id.IntegerValue) for element_id in uidoc.Selection.GetElementIds()]
+                    raw_ids = [get_element_id_text(element_id) for element_id in uidoc.Selection.GetElementIds()]
                 except Exception:
                     raw_ids = []
             if isinstance(raw_ids, (str, int)):
@@ -963,7 +964,7 @@ def register_routes(api):
             missing_ids = []
             for raw_id in raw_ids:
                 try:
-                    element_id = DB.ElementId(int(str(raw_id).strip()))
+                    element_id = make_element_id(DB, raw_id)
                 except Exception:
                     invalid_ids.append(str(raw_id))
                     continue
@@ -1093,9 +1094,9 @@ def register_routes(api):
                     route_logger.warning("Could not focus snapshot elements: {}".format(focus_error))
 
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-                first_id = element_ids[0].IntegerValue
+                first_id = get_element_id_text(element_ids[0])
                 view_name_part = _safe_filename_component(active_view.Name)
-                prefix = "element_snapshot_{}_{}_{}_{}".format(timestamp, first_id, active_view.Id.IntegerValue, view_name_part)
+                prefix = "element_snapshot_{}_{}_{}_{}".format(timestamp, first_id, get_element_id_text(active_view.Id), view_name_part)
                 file_prefix_path = os.path.join(capture_dir, prefix)
 
                 before_files = _snapshot_capture_files(capture_dir)
@@ -1157,7 +1158,7 @@ def register_routes(api):
                     "file_size_bytes": file_size,
                     "capture_dir": capture_dir,
                     "requested_pixel_size": pixel_size,
-                    "element_ids": [str(element_id.IntegerValue) for element_id in element_ids],
+                    "element_ids": [get_element_id_text(element_id) for element_id in element_ids],
                     "invalid_ids": invalid_ids,
                     "missing_ids": missing_ids,
                     "missing_bbox_ids": missing_bbox_ids,
@@ -1254,7 +1255,7 @@ def register_routes(api):
                             "message": "Multiple views match '{}'. Retry with view_id.".format(view_name),
                             "matching_views": [
                                 {
-                                    "id": str(view.Id.IntegerValue),
+                                    "id": get_element_id_text(view.Id),
                                     "name": to_safe_ascii_text(view.Name),
                                     "type": str(view.ViewType),
                                     "is_template": bool(getattr(view, "IsTemplate", False)),
@@ -1348,17 +1349,17 @@ def register_routes(api):
                 "status": "success",
                 "message": "Duplicated view '{}' as '{}'.".format(source_view.Name, new_view.Name),
                 "source_view": {
-                    "id": str(source_view.Id.IntegerValue),
+                    "id": get_element_id_text(source_view.Id),
                     "name": to_safe_ascii_text(source_view.Name),
                     "type": str(source_view.ViewType),
                 },
                 "new_view": {
-                    "id": str(new_view.Id.IntegerValue),
+                    "id": get_element_id_text(new_view.Id),
                     "name": to_safe_ascii_text(new_view.Name),
                     "type": str(new_view.ViewType),
                     "is_template": bool(getattr(new_view, "IsTemplate", False)),
                     "view_template_id": (
-                        str(new_view.ViewTemplateId.IntegerValue)
+                        get_element_id_text(new_view.ViewTemplateId)
                         if getattr(new_view, "ViewTemplateId", None) and new_view.ViewTemplateId != DB.ElementId.InvalidElementId
                         else None
                     ),
@@ -1422,7 +1423,7 @@ def register_routes(api):
                     view_info = {
                         "name": to_safe_ascii_text(view.Name),
                         "type": get_view_type_name(view, route_logger),
-                        "id": str(view.Id.IntegerValue),
+                        "id": get_element_id_text(view.Id),
                         "can_be_placed": can_be_placed,
                         "is_on_sheet": is_on_sheet,
                         "sheet_name": to_safe_ascii_text(sheet_name) if sheet_name else None

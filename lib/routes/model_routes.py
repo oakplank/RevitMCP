@@ -4,6 +4,7 @@
 from pyrevit import routes, script, DB
 
 from routes.json_safety import sanitize_for_json
+from routes.revit_compat import get_element_id_text
 
 
 try:
@@ -89,7 +90,7 @@ def _parameter_text(parameter, doc):
                 element = doc.GetElement(element_id)
                 if element and getattr(element, "Name", None):
                     return _safe_name(element.Name)
-                return _safe_name(element_id.IntegerValue)
+                return _safe_name(get_element_id_text(element_id))
     except Exception:
         return None
 

@@ -43,6 +43,35 @@ except ImportError:
     BoundingBoxUV = None
     UV = None
 
+try:
+    from routes.revit_compat import get_element_id_text, get_element_id_value, make_element_id
+except Exception:
+    try:
+        import System as _System
+    except Exception:
+        _System = None
+
+    def get_element_id_value(element_id):
+        for attr_name in ("Value", "IntegerValue"):
+            try:
+                return int(getattr(element_id, attr_name))
+            except Exception:
+                pass
+        return None
+
+    def get_element_id_text(element_id):
+        value = get_element_id_value(element_id)
+        return str(value) if value is not None else None
+
+    def make_element_id(element_id_class, value):
+        value = int(str(value).strip())
+        if _System is not None:
+            try:
+                return element_id_class(_System.Int64(value))
+            except Exception:
+                pass
+        return element_id_class(value)
+
 
 def find_views_by_name(doc, view_name, logger, exact_match=False):
     """
@@ -358,7 +387,7 @@ def _find_target_sheet(doc, sheet_id=None, sheet_name=None, exact_match=False, l
                 "status": "error",
                 "message": "target_sheet_id must be an integer element id, got '{}'".format(sheet_id),
             }
-        element = doc.GetElement(ElementId(sheet_id_int))
+        element = doc.GetElement(make_element_id(ElementId, sheet_id_int))
         if not element:
             return None, {
                 "status": "error",
@@ -396,7 +425,7 @@ def _find_target_sheet(doc, sheet_id=None, sheet_name=None, exact_match=False, l
                 "message": "Multiple sheets matched '{}'. Disambiguate by retrying with target_sheet_id.".format(sheet_name_str),
                 "target_sheet_name": sheet_name_str,
                 "matching_sheets": [
-                    {"name": s.Name, "number": s.SheetNumber, "id": str(s.Id.IntegerValue)}
+                    {"name": s.Name, "number": s.SheetNumber, "id": get_element_id_text(s.Id)}
                     for s in matches
                 ],
             }
@@ -410,7 +439,7 @@ def _is_titleblock_symbol(symbol):
         category = getattr(symbol, "Category", None)
         if not category or not getattr(category, "Id", None):
             return False
-        return category.Id.IntegerValue == int(BuiltInCategory.OST_TitleBlocks)
+        return get_element_id_value(category.Id) == int(BuiltInCategory.OST_TitleBlocks)
     except Exception:
         return False
 
@@ -442,7 +471,7 @@ def _find_titleblock(doc, titleblock_id=None, titleblock_name=None, exact_match=
                 "status": "error",
                 "message": "titleblock_id must be an integer element id, got '{}'".format(titleblock_id),
             }
-        element = doc.GetElement(ElementId(tb_id_int))
+        element = doc.GetElement(make_element_id(ElementId, tb_id_int))
         if not element:
             return None, {
                 "status": "error",
@@ -502,7 +531,7 @@ def _find_titleblock(doc, titleblock_id=None, titleblock_name=None, exact_match=
                 "titleblock_name": name_str,
                 "matching_titleblocks": [
                     {
-                        "id": str(s.Id.IntegerValue),
+                        "id": get_element_id_text(s.Id),
                         "family_name": (s.Family.Name if s.Family else ""),
                         "type_name": getattr(s, "Name", ""),
                         "label": _titleblock_label(s),
@@ -556,7 +585,7 @@ def place_view_on_new_sheet(doc, view_name, logger, exact_match=False, view_id=N
                     "status": "error",
                     "message": "view_id must be an integer element id, got '{}'".format(view_id),
                 }
-            element = doc.GetElement(ElementId(view_id_int))
+            element = doc.GetElement(make_element_id(ElementId, view_id_int))
             if not element:
                 return {
                     "status": "error",
@@ -593,7 +622,7 @@ def place_view_on_new_sheet(doc, view_name, logger, exact_match=False, view_id=N
                 "view_name": view_name,
                 "exact_match": bool(exact_match),
                 "matching_views": [
-                    {"name": v.Name, "type": get_view_type_name(v, logger), "id": str(v.Id.IntegerValue)}
+                    {"name": v.Name, "type": get_view_type_name(v, logger), "id": get_element_id_text(v.Id)}
                     for v in matching_views
                 ],
             }
@@ -672,7 +701,7 @@ def place_view_on_new_sheet(doc, view_name, logger, exact_match=False, view_id=N
                     try:
                         if hasattr(view_to_place, 'Sheet') and view_to_place.Sheet and view_to_place.Sheet.Id != ElementId.InvalidElementId:
                             already_on_sheet = {
-                                "id": str(view_to_place.Sheet.Id.IntegerValue),
+                                "id": get_element_id_text(view_to_place.Sheet.Id),
                                 "name": view_to_place.Sheet.Name,
                                 "number": view_to_place.Sheet.SheetNumber,
                             }
@@ -690,7 +719,7 @@ def place_view_on_new_sheet(doc, view_name, logger, exact_match=False, view_id=N
                             )
                         ),
                         "view_name": view_to_place.Name,
-                        "view_id": str(view_to_place.Id.IntegerValue),
+                        "view_id": get_element_id_text(view_to_place.Id),
                         "already_on_sheet": already_on_sheet,
                     }
 
@@ -701,18 +730,18 @@ def place_view_on_new_sheet(doc, view_name, logger, exact_match=False, view_id=N
                     "status": "success",
                     "view_name": view_to_place.Name,
                     "view_type": view_type_name,
-                    "sheet_id": str(target_sheet.Id.IntegerValue),
+                    "sheet_id": get_element_id_text(target_sheet.Id),
                     "sheet_number": target_sheet.SheetNumber,
                     "sheet_name": target_sheet.Name,
                     "sheet_was_created": sheet_was_created,
-                    "viewport_id": str(viewport.Id.IntegerValue),
+                    "viewport_id": get_element_id_text(viewport.Id),
                 }
                 if sheet_was_created:
                     result["message"] = "Successfully placed view '{}' on new sheet '{}'".format(
                         view_to_place.Name, target_sheet.SheetNumber
                     )
                     result["titleblock_used"] = {
-                        "id": str(titleblock.Id.IntegerValue),
+                        "id": get_element_id_text(titleblock.Id),
                         "family_name": titleblock.Family.Name if titleblock.Family else "",
                         "type_name": getattr(titleblock, "Name", ""),
                         "label": _titleblock_label(titleblock),
