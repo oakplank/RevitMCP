@@ -17,9 +17,11 @@ from pyrevit import routes, script, DB
 from System.Collections.Generic import List
 
 from routes.json_safety import sanitize_for_json
+from routes.revit_compat import get_element_id_text, get_element_id_value, make_element_id
 
 
 ROUTE_DIAGNOSTIC_VERSION = "2026-05-02-strong-selection-diagnostics"
+MM_PER_FOOT = 304.8
 
 
 try:
@@ -83,7 +85,7 @@ def _get_document_category_lookup(doc):
 
             built_in_category = None
             try:
-                built_in_category = System.Enum.ToObject(DB.BuiltInCategory, category.Id.IntegerValue)
+                built_in_category = System.Enum.ToObject(DB.BuiltInCategory, get_element_id_value(category.Id))
             except Exception:
                 built_in_category = None
 
@@ -245,8 +247,8 @@ def _get_parameter_display_value(param, doc):
                 ref_elem = doc.GetElement(elem_id)
                 if ref_elem:
                     name = getattr(ref_elem, "Name", None)
-                    return name if name else str(elem_id.IntegerValue)
-                return str(elem_id.IntegerValue)
+                    return name if name else _safe_element_id_text(elem_id)
+                return _safe_element_id_text(elem_id)
             return "None"
 
         return param.AsValueString() or ""
@@ -386,6 +388,148 @@ def _set_parameter_value(param, new_value):
     return False, "Unsupported parameter type: {}".format(param.StorageType)
 
 
+def _find_parameter_with_scope(element, param_name, doc=None, include_type=False):
+    param = _find_parameter_on_element(element, param_name)
+    if param:
+        return param, "instance"
+
+    if not include_type:
+        return None, None
+
+    param = _find_parameter_on_element(_get_type_element(element, doc), param_name)
+    if param:
+        return param, "type"
+
+    return None, None
+
+
+def _normalize_sync_target_policy(value):
+    text = _collapse_whitespace(value).lower()
+    if not text:
+        return "missing_only"
+    if text in ("missing_only", "missing", "only_missing", "only_blanks", "blanks_only", "blank_only"):
+        return "missing_only"
+    if text in ("overwrite_all", "all", "overwrite", "replace_all"):
+        return "overwrite_all"
+    return None
+
+
+def _normalize_sync_conflict_policy(value):
+    text = _collapse_whitespace(value).lower()
+    if not text:
+        return "use_first"
+    if text in ("use_first", "first", "first_populated", "write_first"):
+        return "use_first"
+    if text in ("skip", "skip_conflicts", "skip_ambiguous", "ambiguous_skip"):
+        return "skip"
+    return None
+
+
+def _normalize_sync_source_strategy(value):
+    text = _collapse_whitespace(value).lower()
+    if not text:
+        return "first_populated"
+    if text in ("first_populated", "coalesce", "first_available", "first_non_blank"):
+        return "first_populated"
+    return None
+
+
+def _normalize_parameter_name_list(values):
+    normalized = []
+    seen = set()
+
+    if not isinstance(values, list):
+        return normalized
+
+    for value in values:
+        text = _collapse_whitespace(value)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+
+    return normalized
+
+
+def _normalize_ignored_source_values(values):
+    ignored_values = set()
+
+    if not isinstance(values, list):
+        return ignored_values
+
+    for value in values:
+        text = _collapse_whitespace(value).lower()
+        if text:
+            ignored_values.add(text)
+
+    return ignored_values
+
+
+def _is_ignored_source_value(value, ignored_values):
+    text = _collapse_whitespace(value).lower()
+    if not text or not ignored_values:
+        return False
+    if text in ignored_values:
+        return True
+
+    if "0" not in ignored_values and "0 mm" not in ignored_values:
+        return False
+
+    try:
+        return abs(_parse_length_to_internal_feet(text)) < 0.0000001
+    except Exception:
+        try:
+            return abs(float(text)) < 0.0000001
+        except Exception:
+            return False
+
+
+def _sync_result_record(element_id_text, status, reason=None):
+    record = {
+        "element_id": element_id_text,
+        "status": status,
+    }
+    if reason:
+        record["reason"] = reason
+    return record
+
+
+def _source_values_for_sync(element, doc, source_parameters, include_type_parameters, ignored_source_values=None):
+    populated = []
+    missing = []
+    ignored_source_values = ignored_source_values or set()
+
+    for source_name in source_parameters:
+        param, scope = _find_parameter_with_scope(
+            element,
+            source_name,
+            doc=doc,
+            include_type=include_type_parameters,
+        )
+        if not param:
+            missing.append(source_name)
+            continue
+
+        display_value = _get_parameter_display_value(param, doc)
+        if not _is_meaningful_value(display_value):
+            missing.append(source_name)
+            continue
+        if _is_ignored_source_value(display_value, ignored_source_values):
+            missing.append(source_name)
+            continue
+
+        populated.append({
+            "parameter": source_name,
+            "value": display_value,
+            "scope": scope,
+        })
+
+    return populated, missing
+
+
 def _coerce_bool(value, default=False):
     if value is None:
         return default
@@ -442,7 +586,7 @@ def _get_active_view_context(uidoc=None, doc=None):
 
     context = {"has_active_view": True, "id": None, "name": None, "type": None}
     try:
-        context["id"] = str(view.Id.IntegerValue)
+        context["id"] = _safe_element_id_text(view.Id)
     except Exception:
         pass
     try:
@@ -562,7 +706,7 @@ def _get_selection_snapshot(uidoc, doc, limit=20):
         for elem_id in selected_ids:
             if len(snapshot["element_ids"]) >= limit:
                 break
-            snapshot["element_ids"].append(str(elem_id.IntegerValue))
+            snapshot["element_ids"].append(_safe_element_id_text(elem_id))
             element = doc.GetElement(elem_id) if doc else None
             if element:
                 snapshot["elements"].append(_build_element_summary(element, doc))
@@ -679,7 +823,7 @@ def _select_element_id_values(uidoc, doc, element_id_values, requested_count, in
     elements_with_location = 0
 
     for element_id_value in element_id_values:
-        elem_id = DB.ElementId(int(element_id_value))
+        elem_id = make_element_id(DB, element_id_value)
         element = doc.GetElement(elem_id)
         if element:
             valid_existing_ids.Add(elem_id)
@@ -1006,7 +1150,7 @@ def _get_element_identity(element, doc):
         if type_name != "Not available":
             display_name = type_name
         else:
-            display_name = str(element.Id.IntegerValue)
+            display_name = _safe_element_id_text(element.Id)
 
     return display_name, family_name, type_name
 
@@ -1022,7 +1166,7 @@ def _build_element_summary(element, doc):
     display_name, family_name, type_name = _get_element_identity(element, doc)
 
     summary = {
-        "element_id": str(element.Id.IntegerValue),
+        "element_id": _safe_element_id_text(element.Id),
         "name": display_name,
         "category": category_name
     }
@@ -1043,20 +1187,15 @@ def _build_element_summary(element, doc):
 
 
 def _safe_element_id_text(element_id):
-    if not element_id:
+    text = get_element_id_text(element_id)
+    if text is None:
         return None
     try:
         if element_id == DB.ElementId.InvalidElementId:
             return None
     except Exception:
         pass
-    try:
-        return str(element_id.IntegerValue)
-    except Exception:
-        try:
-            return str(element_id.Value)
-        except Exception:
-            return str(element_id)
+    return text
 
 
 def _safe_xyz_summary(xyz):
@@ -1070,6 +1209,217 @@ def _safe_xyz_summary(xyz):
         }
     except Exception:
         return None
+
+
+def _xyz_payload(xyz):
+    point = _safe_xyz_summary(xyz)
+    if not point:
+        return None
+
+    return {
+        "x": point["x"],
+        "y": point["y"],
+        "z": point["z"],
+        "unit": "ft",
+        "x_mm": point["x"] * MM_PER_FOOT,
+        "y_mm": point["y"] * MM_PER_FOOT,
+        "z_mm": point["z"] * MM_PER_FOOT,
+    }
+
+
+def _rounded_mm_payload(point_payload, precision_mm):
+    if not point_payload or not precision_mm or precision_mm <= 0:
+        return None
+
+    def _round_to_precision(value):
+        return round(float(value) / precision_mm) * precision_mm
+
+    try:
+        return {
+            "x_mm": _round_to_precision(point_payload["x_mm"]),
+            "y_mm": _round_to_precision(point_payload["y_mm"]),
+            "z_mm": _round_to_precision(point_payload["z_mm"]),
+            "precision_mm": precision_mm,
+        }
+    except Exception:
+        return None
+
+
+def _location_key_from_rounded(level_value, rounded_point, include_z=True):
+    if not rounded_point:
+        return None
+
+    level_text = _collapse_whitespace(level_value) or "unknown"
+    parts = [
+        "L{}".format(level_text),
+        "{:.3f}".format(float(rounded_point["x_mm"])),
+        "{:.3f}".format(float(rounded_point["y_mm"])),
+    ]
+    if include_z:
+        parts.append("{:.3f}".format(float(rounded_point["z_mm"])))
+    return "|".join(parts)
+
+
+def _location_point_from_element(element):
+    try:
+        location = getattr(element, "Location", None)
+    except Exception:
+        location = None
+
+    if not location:
+        return None, None
+
+    try:
+        point = getattr(location, "Point", None)
+        if point:
+            return point, "location_point"
+    except Exception:
+        pass
+
+    try:
+        curve = getattr(location, "Curve", None)
+        if curve:
+            return curve.Evaluate(0.5, True), "location_curve_midpoint"
+    except Exception:
+        pass
+
+    return None, None
+
+
+def _bounding_box_corners(bbox):
+    corners = []
+    if not bbox:
+        return corners
+
+    try:
+        transform = getattr(bbox, "Transform", None) or DB.Transform.Identity
+    except Exception:
+        transform = None
+
+    min_pt = bbox.Min
+    max_pt = bbox.Max
+    for x in (min_pt.X, max_pt.X):
+        for y in (min_pt.Y, max_pt.Y):
+            for z in (min_pt.Z, max_pt.Z):
+                corner = DB.XYZ(x, y, z)
+                if transform:
+                    try:
+                        corner = transform.OfPoint(corner)
+                    except Exception:
+                        pass
+                corners.append(corner)
+    return corners
+
+
+def _bounding_box_payload(element):
+    try:
+        bbox = element.get_BoundingBox(None)
+    except Exception:
+        bbox = None
+
+    corners = _bounding_box_corners(bbox)
+    if not corners:
+        return None
+
+    min_x = min(point.X for point in corners)
+    min_y = min(point.Y for point in corners)
+    min_z = min(point.Z for point in corners)
+    max_x = max(point.X for point in corners)
+    max_y = max(point.Y for point in corners)
+    max_z = max(point.Z for point in corners)
+    center = DB.XYZ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0, (min_z + max_z) / 2.0)
+
+    return {
+        "min": _xyz_payload(DB.XYZ(min_x, min_y, min_z)),
+        "max": _xyz_payload(DB.XYZ(max_x, max_y, max_z)),
+        "center": _xyz_payload(center),
+    }
+
+
+def _location_candidate_for_element(element, include_bounding_box=True):
+    point, source = _location_point_from_element(element)
+    bbox = _bounding_box_payload(element) if include_bounding_box else None
+
+    if point:
+        return {
+            "point": _xyz_payload(point),
+            "source": source,
+            "bounding_box": bbox,
+        }
+
+    if bbox and bbox.get("center"):
+        return {
+            "point": bbox.get("center"),
+            "source": "bounding_box_center",
+            "bounding_box": bbox,
+        }
+
+    return {
+        "point": None,
+        "source": None,
+        "bounding_box": bbox,
+    }
+
+
+def _element_location_metadata(element, doc):
+    metadata = {}
+
+    for param_name in ("Install Level", "Comments"):
+        try:
+            param = _find_parameter(element, param_name, doc=doc, include_type=True)
+            display_value = _get_parameter_display_value(param, doc) if param else None
+            if _is_meaningful_value(display_value):
+                metadata[param_name] = display_value
+        except Exception:
+            pass
+
+    level_name = _get_element_level_name(element, doc)
+    if level_name:
+        metadata["Level"] = level_name
+
+    return metadata
+
+
+def _element_location_record(element, doc, include_bounding_box=True, include_fallbacks=True, rounding_precision_mm=1.0):
+    metadata = _element_location_metadata(element, doc)
+    candidate = _location_candidate_for_element(element, include_bounding_box=include_bounding_box)
+    fallback_element = None
+    fallback_relationship = None
+
+    if not candidate.get("point") and include_fallbacks:
+        parent, relationship = _next_parent_relationship(element)
+        if parent:
+            parent_candidate = _location_candidate_for_element(parent, include_bounding_box=include_bounding_box)
+            if parent_candidate.get("point"):
+                candidate = parent_candidate
+                fallback_element = _element_ref_summary(parent, doc, relationship=relationship)
+                fallback_relationship = relationship
+
+    rounded_point = _rounded_mm_payload(candidate.get("point"), rounding_precision_mm)
+    install_level = metadata.get("Install Level") or metadata.get("Level")
+
+    record = {
+        "element": _element_ref_summary(element, doc),
+        "metadata": metadata,
+        "point": candidate.get("point"),
+        "rounded_point_mm": rounded_point,
+        "location_source": candidate.get("source"),
+        "xy_overlap_key": _location_key_from_rounded(install_level, rounded_point, include_z=False),
+        "xyz_overlap_key": _location_key_from_rounded(install_level, rounded_point, include_z=True),
+    }
+
+    if include_bounding_box:
+        record["bounding_box"] = candidate.get("bounding_box")
+
+    if fallback_element:
+        record["fallback_element"] = fallback_element
+        record["fallback_relationship"] = fallback_relationship
+        record["location_source"] = "{}_{}".format(fallback_relationship, candidate.get("source"))
+
+    if not record.get("point"):
+        record["location_error"] = "No Location point, Location curve, bounding box, or parent fallback location was available."
+
+    return record
 
 
 def _element_ref_summary(element, doc, relationship=None):
@@ -1332,7 +1682,7 @@ def register_routes(api):
                     associated_level = None
 
             view_info = {
-                "id": str(active_view.Id.IntegerValue),
+                "id": _safe_element_id_text(active_view.Id),
                 "name": active_view.Name,
                 "type": str(active_view.ViewType),
                 "scale": int(getattr(active_view, "Scale", 0) or 0),
@@ -1426,14 +1776,14 @@ def register_routes(api):
                 if len(element_ids) >= limit:
                     continue
 
-                element_ids.append(str(element.Id.IntegerValue))
+                element_ids.append(_safe_element_id_text(element.Id))
                 elements.append(_build_element_summary(element, doc))
 
             return {
                 "status": "success",
                 "message": "Found {} matching elements in the active view.".format(total_count),
                 "view": {
-                    "id": str(active_view.Id.IntegerValue),
+                    "id": _safe_element_id_text(active_view.Id),
                     "name": active_view.Name,
                     "type": str(active_view.ViewType)
                 },
@@ -1482,7 +1832,7 @@ def register_routes(api):
                 if not element:
                     continue
 
-                element_ids.append(str(elem_id.IntegerValue))
+                element_ids.append(_safe_element_id_text(elem_id))
                 elements.append(_build_element_summary(element, doc))
 
             return {
@@ -1553,7 +1903,7 @@ def register_routes(api):
                         continue
 
                     family_types.append({
-                        "symbol_id": str(symbol.Id.IntegerValue),
+                        "symbol_id": _safe_element_id_text(symbol.Id),
                         "category": category_name or "No Category",
                         "family_name": family_name or "Unnamed Family",
                         "type_name": type_name or "Unnamed Type",
@@ -1628,7 +1978,7 @@ def register_routes(api):
 
             # Convert ElementId objects to string list
             for element_id in element_ids_collector:
-                element_ids.append(str(element_id.IntegerValue))
+                element_ids.append(_safe_element_id_text(element_id))
 
             if not element_ids:
                 route_logger.info("No elements found for category '{}' to return.".format(category_name_payload))
@@ -1734,7 +2084,7 @@ def register_routes(api):
                 if include_element:
                     filtered_elements.append(element)
 
-            element_ids = [str(elem.Id.IntegerValue) for elem in filtered_elements]
+            element_ids = [_safe_element_id_text(elem.Id) for elem in filtered_elements]
 
             return {
                 "status": "success",
@@ -1771,7 +2121,7 @@ def register_routes(api):
 
             for id_str in element_ids_list:
                 try:
-                    element = doc.GetElement(DB.ElementId(int(id_str)))
+                    element = doc.GetElement(make_element_id(DB, id_str))
                     if not element:
                         results.append({"element_id": id_str, "error": "Element not found", "properties": {}, "typed_properties": {}})
                         continue
@@ -1896,7 +2246,7 @@ def register_routes(api):
             for id_value in element_ids_list:
                 id_text = str(id_value).strip()
                 try:
-                    element_id = DB.ElementId(int(id_text))
+                    element_id = make_element_id(DB, id_text)
                 except Exception:
                     invalid_ids.append(id_text)
                     results.append({
@@ -1966,6 +2316,387 @@ def register_routes(api):
                 }),
             )
 
+    @api.route('/elements/locations', methods=['POST'])
+    def handle_get_element_locations(doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            if not payload or not isinstance(payload, dict):
+                return routes.Response(status=400, data={"status": "error", "error": "Invalid JSON payload"})
+
+            element_ids_list = payload.get('element_ids')
+            if not element_ids_list:
+                return routes.Response(status=400, data={"status": "error", "error": "Missing 'element_ids'"})
+
+            include_bounding_box = _coerce_bool(payload.get("include_bounding_box"), default=True)
+            include_fallbacks = _coerce_bool(payload.get("include_fallbacks"), default=True)
+            try:
+                rounding_precision_mm = float(payload.get("rounding_precision_mm", 1.0))
+            except Exception:
+                rounding_precision_mm = 1.0
+            if rounding_precision_mm < 0:
+                rounding_precision_mm = 0.0
+            if rounding_precision_mm > 10000:
+                rounding_precision_mm = 10000.0
+
+            results = []
+            missing_ids = []
+            invalid_ids = []
+
+            for id_value in element_ids_list:
+                id_text = str(id_value).strip()
+                try:
+                    element_id = make_element_id(DB, id_text)
+                except Exception:
+                    invalid_ids.append(id_text)
+                    results.append({
+                        "element_id": id_text,
+                        "status": "error",
+                        "error": "Invalid element id.",
+                    })
+                    continue
+
+                try:
+                    element = doc.GetElement(element_id)
+                    if not element:
+                        missing_ids.append(id_text)
+                        results.append({
+                            "element_id": id_text,
+                            "status": "error",
+                            "error": "Element not found.",
+                        })
+                        continue
+
+                    record = _element_location_record(
+                        element,
+                        doc,
+                        include_bounding_box=include_bounding_box,
+                        include_fallbacks=include_fallbacks,
+                        rounding_precision_mm=rounding_precision_mm,
+                    )
+                    record["element_id"] = id_text
+                    record["status"] = "success"
+                    results.append(record)
+                except Exception as elem_error:
+                    route_logger.warning("Error reading location for element {}: {}".format(id_text, elem_error))
+                    results.append({
+                        "element_id": id_text,
+                        "status": "error",
+                        "error": str(elem_error),
+                    })
+
+            return sanitize_for_json({
+                "status": "success",
+                "message": "Retrieved locations for {} requested elements.".format(len(element_ids_list)),
+                "count": len(results),
+                "locations": results,
+                "missing_ids": missing_ids,
+                "invalid_ids": invalid_ids,
+                "options": {
+                    "include_bounding_box": include_bounding_box,
+                    "include_fallbacks": include_fallbacks,
+                    "rounding_precision_mm": rounding_precision_mm,
+                },
+            })
+
+        except Exception as e:
+            route_logger.error("Error in /elements/locations: {}".format(e), exc_info=True)
+            return routes.Response(
+                status=500,
+                data=sanitize_for_json({
+                    "status": "error",
+                    "error": "Internal server error while reading element locations.",
+                    "details": str(e),
+                }),
+            )
+
+    @api.route('/elements/sync_parameters', methods=['POST'])
+    def handle_sync_element_parameter_values(uidoc, doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            if not payload or not isinstance(payload, dict):
+                return routes.Response(status=400, data={"status": "error", "error": "Invalid JSON payload"})
+
+            element_ids_list = payload.get("element_ids")
+            if not element_ids_list or not isinstance(element_ids_list, list):
+                return routes.Response(status=400, data={"status": "error", "error": "Missing 'element_ids' list"})
+
+            source_parameters = _normalize_parameter_name_list(payload.get("source_parameters"))
+            target_parameter = _collapse_whitespace(payload.get("target_parameter"))
+            if not source_parameters:
+                return routes.Response(status=400, data={"status": "error", "error": "Missing 'source_parameters' list"})
+            if not target_parameter:
+                return routes.Response(status=400, data={"status": "error", "error": "Missing 'target_parameter'"})
+
+            source_strategy = _normalize_sync_source_strategy(payload.get("source_strategy"))
+            if not source_strategy:
+                return routes.Response(
+                    status=400,
+                    data={
+                        "status": "error",
+                        "error": "Unsupported source_strategy.",
+                        "supported_source_strategies": ["first_populated"],
+                    },
+                )
+
+            target_policy = _normalize_sync_target_policy(payload.get("target_policy"))
+            if not target_policy:
+                return routes.Response(
+                    status=400,
+                    data={
+                        "status": "error",
+                        "error": "Unsupported target_policy.",
+                        "supported_target_policies": ["missing_only", "overwrite_all"],
+                    },
+                )
+
+            conflict_policy = _normalize_sync_conflict_policy(payload.get("conflict_policy"))
+            if not conflict_policy:
+                return routes.Response(
+                    status=400,
+                    data={
+                        "status": "error",
+                        "error": "Unsupported conflict_policy.",
+                        "supported_conflict_policies": ["use_first", "skip"],
+                    },
+                )
+
+            dry_run = _coerce_bool(payload.get("dry_run"), default=True)
+            include_type_parameters = _coerce_bool(payload.get("include_type_parameters"), default=True)
+            ignored_source_values = _normalize_ignored_source_values(payload.get("ignored_source_values"))
+            max_results = _bounded_int(payload.get("max_results"), 50, min_value=0, max_value=500)
+
+            results = []
+            conflict_samples = []
+            summary = {
+                "total": len(element_ids_list),
+                "updated": 0,
+                "would_update": 0,
+                "skipped_existing_target": 0,
+                "skipped_no_source_value": 0,
+                "skipped_conflicts": 0,
+                "missing_target_parameter": 0,
+                "read_only_target_parameter": 0,
+                "missing_elements": 0,
+                "invalid_element_ids": 0,
+                "errors": 0,
+                "conflicts": 0,
+            }
+
+            transaction = None
+            if not dry_run:
+                transaction = DB.Transaction(doc, "RevitMCP Sync Element Parameter Values")
+                try:
+                    transaction.Start()
+                except Exception as transaction_start_error:
+                    route_logger.error(
+                        "Could not start RevitMCP Sync Element Parameter Values transaction: {}".format(transaction_start_error),
+                        exc_info=True,
+                    )
+                    return routes.Response(
+                        status=409,
+                        data={
+                            "status": "error",
+                            "error": "Could not start Revit transaction.",
+                            "details": str(transaction_start_error),
+                            "document_state": sanitize_for_json(_get_document_write_state(doc, uidoc)),
+                        },
+                    )
+
+            try:
+                for id_value in element_ids_list:
+                    element_id_text = _collapse_whitespace(id_value)
+                    if not element_id_text:
+                        summary["invalid_element_ids"] += 1
+                        summary["errors"] += 1
+                        if len(results) < max_results:
+                            results.append(_sync_result_record(element_id_text, "error", "Invalid element id."))
+                        continue
+
+                    try:
+                        element_id = make_element_id(DB, element_id_text)
+                    except Exception:
+                        summary["invalid_element_ids"] += 1
+                        summary["errors"] += 1
+                        if len(results) < max_results:
+                            results.append(_sync_result_record(element_id_text, "error", "Invalid element id."))
+                        continue
+
+                    try:
+                        element = doc.GetElement(element_id)
+                        if not element:
+                            summary["missing_elements"] += 1
+                            summary["errors"] += 1
+                            if len(results) < max_results:
+                                results.append(_sync_result_record(element_id_text, "error", "Element not found."))
+                            continue
+
+                        target_param = _find_parameter(element, target_parameter)
+                        if not target_param:
+                            summary["missing_target_parameter"] += 1
+                            summary["errors"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "error", "Target parameter not found.")
+                                record["target_parameter"] = target_parameter
+                                results.append(record)
+                            continue
+
+                        target_display_value = _get_parameter_display_value(target_param, doc)
+                        target_has_value = _is_meaningful_value(target_display_value)
+                        if target_policy == "missing_only" and target_has_value:
+                            summary["skipped_existing_target"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "skipped", "Target already has a value.")
+                                record["target_parameter"] = target_parameter
+                                record["target_value"] = target_display_value
+                                results.append(record)
+                            continue
+
+                        populated_sources, missing_sources = _source_values_for_sync(
+                            element,
+                            doc,
+                            source_parameters,
+                            include_type_parameters,
+                            ignored_source_values=ignored_source_values,
+                        )
+                        if len(populated_sources) > 1:
+                            summary["conflicts"] += 1
+                            if len(conflict_samples) < 20:
+                                conflict_samples.append({
+                                    "element_id": element_id_text,
+                                    "populated_sources": populated_sources,
+                                })
+                            if conflict_policy == "skip":
+                                summary["skipped_conflicts"] += 1
+                                if len(results) < max_results:
+                                    record = _sync_result_record(element_id_text, "skipped", "Multiple populated source parameters were found.")
+                                    record["target_parameter"] = target_parameter
+                                    record["conflict"] = True
+                                    record["populated_sources"] = populated_sources
+                                    results.append(record)
+                                continue
+
+                        if not populated_sources:
+                            summary["skipped_no_source_value"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "skipped", "No populated source parameter was found.")
+                                record["missing_sources"] = missing_sources
+                                results.append(record)
+                            continue
+
+                        if target_param.IsReadOnly:
+                            summary["read_only_target_parameter"] += 1
+                            summary["errors"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "error", "Target parameter is read-only.")
+                                record["target_parameter"] = target_parameter
+                                record["source"] = populated_sources[0]
+                                results.append(record)
+                            continue
+
+                        selected_source = populated_sources[0]
+                        new_value = selected_source.get("value")
+
+                        if dry_run:
+                            summary["would_update"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "would_update")
+                                record["target_parameter"] = target_parameter
+                                record["current_target_value"] = target_display_value
+                                record["source"] = selected_source
+                                if len(populated_sources) > 1:
+                                    record["conflict"] = True
+                                    record["populated_sources"] = populated_sources
+                                results.append(record)
+                            continue
+
+                        ok, err = _set_parameter_value(target_param, new_value)
+                        if ok:
+                            summary["updated"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "updated")
+                                record["target_parameter"] = target_parameter
+                                record["previous_target_value"] = target_display_value
+                                record["source"] = selected_source
+                                if len(populated_sources) > 1:
+                                    record["conflict"] = True
+                                    record["populated_sources"] = populated_sources
+                                results.append(record)
+                        else:
+                            summary["errors"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "error", err)
+                                record["target_parameter"] = target_parameter
+                                record["source"] = selected_source
+                                results.append(record)
+
+                    except Exception as element_error:
+                        route_logger.warning("Error syncing parameters for element {}: {}".format(element_id_text, element_error))
+                        summary["errors"] += 1
+                        if len(results) < max_results:
+                            results.append(_sync_result_record(element_id_text, "error", str(element_error)))
+
+                if transaction:
+                    transaction.Commit()
+
+            except Exception as transaction_error:
+                if transaction:
+                    try:
+                        transaction.RollBack()
+                    except Exception:
+                        pass
+                return routes.Response(
+                    status=500,
+                    data={
+                        "status": "error",
+                        "error": "Parameter sync transaction failed",
+                        "details": str(transaction_error),
+                        "document_state": sanitize_for_json(_get_document_write_state(doc, uidoc)),
+                    },
+                )
+
+            action_count = summary["would_update"] if dry_run else summary["updated"]
+            action_word = "would update" if dry_run else "updated"
+            response = {
+                "status": "success",
+                "message": "Parameter sync {} {} elements; {} skipped existing targets, {} skipped without source values, {} skipped conflicts, {} errors.".format(
+                    action_word,
+                    action_count,
+                    summary["skipped_existing_target"],
+                    summary["skipped_no_source_value"],
+                    summary["skipped_conflicts"],
+                    summary["errors"],
+                ),
+                "dry_run": dry_run,
+                "source_strategy": source_strategy,
+                "target_policy": target_policy,
+                "conflict_policy": conflict_policy,
+                "source_parameters": source_parameters,
+                "target_parameter": target_parameter,
+                "include_type_parameters": include_type_parameters,
+                "ignored_source_values": sorted(list(ignored_source_values)),
+                "summary": summary,
+                "results_sample": results,
+                "results_truncated": len(element_ids_list) > len(results),
+                "results_total": len(element_ids_list),
+                "conflict_samples": conflict_samples,
+            }
+            return sanitize_for_json(response)
+
+        except Exception as e:
+            route_logger.error("Error in /elements/sync_parameters: {}".format(e), exc_info=True)
+            return routes.Response(
+                status=500,
+                data={
+                    "status": "error",
+                    "error": "Internal server error in parameter sync handler",
+                    "details": str(e),
+                },
+            )
+
     @api.route('/elements/update_parameters', methods=['POST'])
     def handle_update_element_parameters(uidoc, doc, request):
         route_logger = script.get_logger()
@@ -2014,7 +2745,7 @@ def register_routes(api):
                         continue
 
                     try:
-                        element = doc.GetElement(DB.ElementId(int(element_id_str)))
+                        element = doc.GetElement(make_element_id(DB, element_id_str))
                         if not element:
                             results.append({
                                 "element_id": element_id_str,

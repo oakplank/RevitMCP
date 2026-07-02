@@ -11,7 +11,7 @@ Repository layout note: this repository root is the pyRevit extension root. If y
 
 ## Tools
 
-RevitMCP exposes 44 tools:
+RevitMCP exposes 46 tools:
 
 | Tool | Description |
 | --- | --- |
@@ -40,8 +40,10 @@ RevitMCP exposes 44 tools:
 | `filter_stored_elements_by_parameter` | Refine a stored result set with batched server-side parameter filtering using one or many target values |
 | `get_element_properties` | Read parameter values for specific elements or an existing result handle |
 | `get_element_relationships` | Read host, parent, child, dependent, and adaptive point relationships for model elements |
+| `get_element_locations` | Read model-space element locations using location points, curve midpoints, bounding-box centers, and host fallbacks |
 | `get_related_element_properties` | Read selected parameters from elements and their host/super-component chains |
 | `update_element_parameters` | Update one or many element parameters with typed value handling |
+| `sync_element_parameter_values` | Copy first populated source parameter values into a target parameter with missing-only or overwrite-all policy and dry-run preview |
 | `override_element_graphics` | Apply or reset active-view graphic overrides for explicit IDs or stored result sets |
 | `delete_elements` | Delete elements with dry-run, confirmation, max-count, unpin, and batch/individual safeguards |
 | `place_view_on_sheet` | Create a new sheet, auto-number it, and place a matched view on it |

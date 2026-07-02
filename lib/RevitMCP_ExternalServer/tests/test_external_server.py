@@ -43,11 +43,13 @@ from RevitMCP_ExternalServer.providers.openai_provider import run_openai_chat
 from RevitMCP_ExternalServer.tools.context_tools import resolve_revit_targets_internal
 from RevitMCP_ExternalServer.tools.element_tools import (
     filter_stored_elements_by_parameter_handler,
+    get_element_locations_handler,
     get_element_relationships_handler,
     get_element_properties_handler,
     get_related_element_properties_handler,
     get_revit_diagnostics_handler,
     select_elements_by_id_handler,
+    sync_element_parameter_values_handler,
 )
 from RevitMCP_ExternalServer.tools.element_operation_tools import (
     delete_elements_handler,
@@ -77,6 +79,80 @@ from RevitMCP_ExternalServer.tools.view_tools import (
 from RevitMCP_ExternalServer.web.chat_service import run_chat_request
 from RevitMCP_UI import ui_manager
 from routes.json_safety import sanitize_for_json
+from routes import revit_compat
+from routes.revit_compat import get_element_id_text, get_element_id_value, make_element_id
+
+
+class RevitCompatTests(unittest.TestCase):
+    def test_element_id_value_prefers_revit_2024_value_property(self):
+        class FakeElementId:
+            Value = 5000000000
+
+            @property
+            def IntegerValue(self):
+                raise OverflowError("IntegerValue cannot fit this ElementId")
+
+        element_id = FakeElementId()
+
+        self.assertEqual(get_element_id_value(element_id), 5000000000)
+        self.assertEqual(get_element_id_text(element_id), "5000000000")
+
+    def test_element_id_value_falls_back_to_integer_value(self):
+        class FakeElementId:
+            IntegerValue = 42
+
+        element_id = FakeElementId()
+
+        self.assertEqual(get_element_id_value(element_id), 42)
+        self.assertEqual(get_element_id_text(element_id), "42")
+
+    def test_make_element_id_uses_int64_cast_when_available(self):
+        original_system = revit_compat.System
+
+        class FakeInt64(int):
+            pass
+
+        class FakeSystem:
+            Int64 = FakeInt64
+
+        class FakeDB:
+            class ElementId:
+                def __init__(self, value):
+                    self.value = value
+
+        revit_compat.System = FakeSystem
+        try:
+            element_id = make_element_id(FakeDB, "5000000000")
+        finally:
+            revit_compat.System = original_system
+
+        self.assertEqual(element_id.value, 5000000000)
+        self.assertIsInstance(element_id.value, FakeInt64)
+
+    def test_make_element_id_falls_back_when_int64_overload_is_unavailable(self):
+        original_system = revit_compat.System
+
+        class FakeInt64(int):
+            pass
+
+        class FakeSystem:
+            Int64 = FakeInt64
+
+        class FakeDB:
+            class ElementId:
+                def __init__(self, value):
+                    if isinstance(value, FakeInt64):
+                        raise TypeError("no Int64 overload")
+                    self.value = value
+
+        revit_compat.System = FakeSystem
+        try:
+            element_id = make_element_id(FakeDB, "123")
+        finally:
+            revit_compat.System = original_system
+
+        self.assertEqual(element_id.value, 123)
+        self.assertNotIsInstance(element_id.value, FakeInt64)
 
 
 class BootstrapTests(unittest.TestCase):
@@ -137,7 +213,9 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("save_revit_memory_note", definition_map)
         self.assertIn("get_revit_diagnostics", definition_map)
         self.assertIn("get_element_relationships", definition_map)
+        self.assertIn("get_element_locations", definition_map)
         self.assertIn("get_related_element_properties", definition_map)
+        self.assertIn("sync_element_parameter_values", definition_map)
         self.assertIn("analyze_model_statistics", definition_map)
         self.assertIn("override_element_graphics", definition_map)
         self.assertIn("delete_elements", definition_map)
@@ -157,6 +235,10 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("create_schedule", definition_map)
         self.assertIn("update_schedule", definition_map)
         self.assertIn("audit_schedule_capabilities", definition_map)
+        sync_schema = definition_map["sync_element_parameter_values"].json_schema
+        self.assertEqual(sync_schema["properties"]["target_policy"]["enum"], ["missing_only", "overwrite_all"])
+        self.assertEqual(sync_schema["properties"]["source_strategy"]["enum"], ["first_populated"])
+        self.assertEqual(sync_schema["properties"]["conflict_policy"]["enum"], ["use_first", "skip"])
 
     def test_dispatch_known_and_unknown_tool(self):
         app, _mcp_server, services, registry = create_application(
@@ -1106,6 +1188,77 @@ class ElementToolTests(unittest.TestCase):
         self.assertEqual(calls[0][2]["transparency"], 45)
         self.assertTrue(calls[0][2]["focus"])
 
+    def test_sync_element_parameter_values_resolves_handle_and_parameter_names(self):
+        calls = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                calls.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "dry_run": payload_data["dry_run"],
+                    "summary": {"would_update": 2, "updated": 0},
+                }
+
+            def is_route_not_defined(self, *_args, **_kwargs):
+                return False
+
+        class FakeResultStore:
+            def resolve_element_ids(self, element_ids=None, result_handle=None, category_name=None):
+                self.request = (element_ids, result_handle, category_name)
+                return ["101", "102"], {"storage_key": "panels", "category": "Curtain Panels", "count": 2}, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        result_store = FakeResultStore()
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(min_confidence_for_parameter_remap=0.82),
+            result_store=result_store,
+            revit_client=FakeRevitClient(),
+        )
+
+        with patch(
+            "RevitMCP_ExternalServer.tools.element_tools.resolve_revit_targets_internal",
+            return_value={
+                "status": "success",
+                "resolved": {
+                    "parameter_names": {
+                        "shade bottom": {"resolved_name": "Shade Height Bottom", "confidence": 0.91},
+                        "part desc": {"resolved_name": "Part Description", "confidence": 0.95},
+                    }
+                },
+            },
+        ):
+            result = sync_element_parameter_values_handler(
+                services,
+                result_handle="res_panels",
+                source_parameters=["shade bottom", "Shade Height Right"],
+                target_parameter="part desc",
+                target_policy="missing_only",
+                conflict_policy="skip",
+                ignored_source_values=["0", "0 mm"],
+                max_results=25,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["result_handle"], "res_panels")
+        self.assertEqual(result["source_record"]["storage_key"], "panels")
+        self.assertEqual(result_store.request, (None, "res_panels", None))
+        self.assertEqual(calls[0][0], "/elements/sync_parameters")
+        self.assertEqual(calls[0][1], "POST")
+        self.assertEqual(calls[0][2]["element_ids"], ["101", "102"])
+        self.assertEqual(calls[0][2]["source_parameters"], ["Shade Height Bottom", "Shade Height Right"])
+        self.assertEqual(calls[0][2]["target_parameter"], "Part Description")
+        self.assertEqual(calls[0][2]["target_policy"], "missing_only")
+        self.assertEqual(calls[0][2]["source_strategy"], "first_populated")
+        self.assertEqual(calls[0][2]["conflict_policy"], "skip")
+        self.assertTrue(calls[0][2]["dry_run"])
+        self.assertTrue(calls[0][2]["include_type_parameters"])
+        self.assertEqual(calls[0][2]["ignored_source_values"], ["0", "0 mm"])
+        self.assertEqual(calls[0][2]["max_results"], 25)
+
     def test_delete_elements_defaults_to_dry_run_and_requires_route_payload(self):
         calls = []
 
@@ -1592,6 +1745,64 @@ class ElementToolTests(unittest.TestCase):
         self.assertTrue(relationship_reads[0][2]["include_adaptive_points"])
         self.assertEqual(relationship_reads[0][2]["max_depth"], 20)
         self.assertEqual(relationship_reads[0][2]["max_children"], 1000)
+
+    def test_get_element_locations_posts_batch_location_payload(self):
+        location_reads = []
+
+        class FakeRevitClient:
+            def call_listener(self, command_path, method, payload_data=None):
+                location_reads.append((command_path, method, payload_data))
+                return {
+                    "status": "success",
+                    "locations": [
+                        {
+                            "element_id": element_id,
+                            "status": "success",
+                            "point": {"x": 1.0, "y": 2.0, "z": 3.0, "unit": "ft"},
+                            "xyz_overlap_key": "L1|304.800|609.600|914.400",
+                        }
+                        for element_id in payload_data["element_ids"]
+                    ],
+                }
+
+            def is_route_not_defined(self, *_args, **_kwargs):
+                return False
+
+        class FakeResultStore:
+            def resolve_element_ids(self, **_kwargs):
+                return ["201", "202", "203"], {"storage_key": "embeds"}, None
+
+            def compact_result_payload(self, result, preserve_keys=None):
+                return result
+
+        services = SimpleNamespace(
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None),
+            config=SimpleNamespace(
+                max_elements_for_property_read=300,
+                max_records_in_response=20,
+            ),
+            result_store=FakeResultStore(),
+            revit_client=FakeRevitClient(),
+        )
+
+        result = get_element_locations_handler(
+            services,
+            result_handle="res_embeds",
+            include_bounding_box=True,
+            include_fallbacks=False,
+            rounding_precision_mm=5.0,
+            limit=2,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["returned_count"], 2)
+        self.assertTrue(result["has_more"])
+        self.assertEqual(result["next_offset"], 2)
+        self.assertEqual(location_reads[0][0], "/elements/locations")
+        self.assertEqual(location_reads[0][2]["element_ids"], ["201", "202"])
+        self.assertTrue(location_reads[0][2]["include_bounding_box"])
+        self.assertFalse(location_reads[0][2]["include_fallbacks"])
+        self.assertEqual(location_reads[0][2]["rounding_precision_mm"], 5.0)
 
     def test_get_related_element_properties_joins_source_and_parent_properties(self):
         calls = []

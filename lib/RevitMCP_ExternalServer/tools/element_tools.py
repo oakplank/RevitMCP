@@ -14,8 +14,10 @@ FILTER_ELEMENTS_TOOL_NAME = "filter_elements"
 FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME = "filter_stored_elements_by_parameter"
 GET_ELEMENT_PROPERTIES_TOOL_NAME = "get_element_properties"
 GET_ELEMENT_RELATIONSHIPS_TOOL_NAME = "get_element_relationships"
+GET_ELEMENT_LOCATIONS_TOOL_NAME = "get_element_locations"
 GET_RELATED_ELEMENT_PROPERTIES_TOOL_NAME = "get_related_element_properties"
 UPDATE_ELEMENT_PARAMETERS_TOOL_NAME = "update_element_parameters"
+SYNC_ELEMENT_PARAMETER_VALUES_TOOL_NAME = "sync_element_parameter_values"
 
 FILTER_STRING_OPERATORS = ["contains", "equals", "not_equals", "starts_with", "ends_with"]
 FILTER_NUMERIC_OPERATORS = ["greater_than", "greater_than_or_equal", "less_than", "less_than_or_equal"]
@@ -678,6 +680,49 @@ def _normalize_filter_values(value=None, values=None) -> list[str]:
     return deduped_values
 
 
+def _normalize_text_list(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+
+    normalized = []
+    seen = set()
+    for value in values:
+        text = _collapse_whitespace(value)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
+
+
+def _normalize_sync_target_policy(value) -> str | None:
+    text = _collapse_whitespace(value or "missing_only").lower()
+    if text in ("missing_only", "missing", "only_missing", "only_blanks", "blanks_only", "blank_only"):
+        return "missing_only"
+    if text in ("overwrite_all", "all", "overwrite", "replace_all"):
+        return "overwrite_all"
+    return None
+
+
+def _normalize_sync_conflict_policy(value) -> str | None:
+    text = _collapse_whitespace(value or "use_first").lower()
+    if text in ("use_first", "first", "first_populated", "write_first"):
+        return "use_first"
+    if text in ("skip", "skip_conflicts", "skip_ambiguous", "ambiguous_skip"):
+        return "skip"
+    return None
+
+
+def _normalize_sync_source_strategy(value) -> str | None:
+    text = _collapse_whitespace(value or "first_populated").lower()
+    if text in ("first_populated", "coalesce", "first_available", "first_non_blank"):
+        return "first_populated"
+    return None
+
+
 def filter_stored_elements_by_parameter_handler(
     services,
     parameter_name: str,
@@ -1059,6 +1104,99 @@ def get_element_relationships_handler(
     return services.result_store.compact_result_payload(result, preserve_keys=preserve_keys)
 
 
+def get_element_locations_handler(
+    services,
+    element_ids: list[str] = None,
+    result_handle: str = None,
+    include_bounding_box: bool = True,
+    include_fallbacks: bool = True,
+    rounding_precision_mm: float = 1.0,
+    offset: int = 0,
+    limit: int = None,
+    **_kwargs,
+) -> dict:
+    resolved_ids, _record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=element_ids,
+        result_handle=result_handle,
+    )
+    if resolve_error:
+        return resolve_error
+
+    requested_count = len(resolved_ids)
+    page_offset = _bounded_int(offset, 0, min_value=0, max_value=requested_count)
+    default_page_cap = max(1, int(services.config.max_records_in_response))
+    explicit_page_cap = max(1, int(services.config.max_elements_for_property_read))
+    max_page_size = explicit_page_cap if limit is not None else default_page_cap
+    default_page_size = min(default_page_cap, requested_count) if requested_count else default_page_cap
+    page_limit = _bounded_int(limit, default_page_size, min_value=1, max_value=max_page_size)
+    page_ids = resolved_ids[page_offset : page_offset + page_limit]
+    next_offset = page_offset + len(page_ids)
+    has_more = next_offset < requested_count
+
+    try:
+        safe_rounding_precision_mm = float(rounding_precision_mm if rounding_precision_mm is not None else 1.0)
+    except Exception:
+        safe_rounding_precision_mm = 1.0
+    safe_rounding_precision_mm = max(0.0, min(10000.0, safe_rounding_precision_mm))
+
+    services.logger.info(
+        "MCP Tool executed: %s with %s source elements, page offset=%s limit=%s",
+        GET_ELEMENT_LOCATIONS_TOOL_NAME,
+        requested_count,
+        page_offset,
+        page_limit,
+    )
+
+    if not page_ids:
+        return {
+            "status": "success",
+            "message": "Retrieved locations for 0 elements.",
+            "count": 0,
+            "locations": [],
+            "source_count": requested_count,
+            "page_offset": page_offset,
+            "page_limit": page_limit,
+            "returned_count": 0,
+            "has_more": False,
+            "next_offset": None,
+        }
+
+    result = services.revit_client.call_listener(
+        command_path="/elements/locations",
+        method="POST",
+        payload_data={
+            "element_ids": page_ids,
+            "include_bounding_box": bool(include_bounding_box),
+            "include_fallbacks": bool(include_fallbacks),
+            "rounding_precision_mm": safe_rounding_precision_mm,
+        },
+    )
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/locations"):
+        return {
+            "status": "error",
+            "error_type": "route_not_defined",
+            "message": "The active Revit route set does not support '/elements/locations'. Reload/update the Revit extension to enable location reads.",
+        }
+    if result.get("status") == "success":
+        locations = result.get("locations", []) or []
+        result["source_count"] = requested_count
+        result["page_offset"] = page_offset
+        result["page_limit"] = page_limit
+        result["returned_count"] = len(locations)
+        result["has_more"] = has_more
+        result["next_offset"] = next_offset if has_more else None
+        result["message"] = "Retrieved locations for {} of {} elements (offset {}, limit {}).".format(
+            len(locations),
+            requested_count,
+            page_offset,
+            page_limit,
+        )
+        if has_more:
+            result["message"] += " Call again with offset={} for the next page.".format(next_offset)
+    preserve_keys = ["locations"] if limit is not None else None
+    return services.result_store.compact_result_payload(result, preserve_keys=preserve_keys)
+
+
 def _normalize_parameter_names(value):
     if not value:
         return []
@@ -1388,6 +1526,132 @@ def update_element_parameters_handler(
     return services.result_store.compact_result_payload(result)
 
 
+def sync_element_parameter_values_handler(
+    services,
+    source_parameters: list[str] = None,
+    target_parameter: str = None,
+    element_ids: list[str] = None,
+    result_handle: str = None,
+    target_policy: str = "missing_only",
+    source_strategy: str = "first_populated",
+    conflict_policy: str = "use_first",
+    dry_run: bool = True,
+    include_type_parameters: bool = True,
+    ignored_source_values: list[str] = None,
+    max_results: int = 50,
+    **_kwargs,
+) -> dict:
+    services.logger.info("MCP Tool executed: %s", SYNC_ELEMENT_PARAMETER_VALUES_TOOL_NAME)
+
+    normalized_source_parameters = _normalize_text_list(source_parameters)
+    normalized_target_parameter = _collapse_whitespace(target_parameter)
+    if not normalized_source_parameters:
+        return {"status": "error", "message": "'source_parameters' must be a non-empty list of parameter names."}
+    if not normalized_target_parameter:
+        return {"status": "error", "message": "'target_parameter' is required."}
+
+    normalized_target_policy = _normalize_sync_target_policy(target_policy)
+    if not normalized_target_policy:
+        return {
+            "status": "error",
+            "message": "Unsupported target_policy '{}'. Use 'missing_only' or 'overwrite_all'.".format(target_policy),
+        }
+
+    normalized_source_strategy = _normalize_sync_source_strategy(source_strategy)
+    if not normalized_source_strategy:
+        return {
+            "status": "error",
+            "message": "Unsupported source_strategy '{}'. Use 'first_populated'.".format(source_strategy),
+        }
+
+    normalized_conflict_policy = _normalize_sync_conflict_policy(conflict_policy)
+    if not normalized_conflict_policy:
+        return {
+            "status": "error",
+            "message": "Unsupported conflict_policy '{}'. Use 'use_first' or 'skip'.".format(conflict_policy),
+        }
+
+    resolved_ids, record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=element_ids,
+        result_handle=result_handle,
+    )
+    if resolve_error:
+        return resolve_error
+    if not isinstance(resolved_ids, list) or not resolved_ids:
+        return {"status": "error", "message": "No element IDs were resolved for parameter sync."}
+
+    resolution = resolve_revit_targets_internal(
+        services,
+        {"parameter_names": normalized_source_parameters + [normalized_target_parameter]},
+    )
+    if resolution.get("status") == "error":
+        return {
+            "status": "error",
+            "message": "Parameter resolution failed before sync.",
+            "resolution": resolution,
+        }
+
+    param_map = resolution.get("resolved", {}).get("parameter_names", {})
+    min_confidence = float(getattr(services.config, "min_confidence_for_parameter_remap", 0.82))
+
+    def resolve_parameter_name(name):
+        mapped = param_map.get(name)
+        if not mapped:
+            return name
+        try:
+            confidence = float(mapped.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+        if confidence >= min_confidence:
+            return mapped.get("resolved_name", name)
+        return name
+
+    resolved_source_parameters = _normalize_text_list(
+        [resolve_parameter_name(name) for name in normalized_source_parameters]
+    )
+    resolved_target_parameter = resolve_parameter_name(normalized_target_parameter)
+    safe_dry_run = True if dry_run is None else bool(dry_run)
+    safe_include_type_parameters = True if include_type_parameters is None else bool(include_type_parameters)
+
+    payload = {
+        "element_ids": [str(element_id).strip() for element_id in resolved_ids if str(element_id).strip()],
+        "source_parameters": resolved_source_parameters,
+        "target_parameter": resolved_target_parameter,
+        "target_policy": normalized_target_policy,
+        "source_strategy": normalized_source_strategy,
+        "conflict_policy": normalized_conflict_policy,
+        "dry_run": safe_dry_run,
+        "include_type_parameters": safe_include_type_parameters,
+        "ignored_source_values": _normalize_text_list(ignored_source_values),
+        "max_results": _bounded_int(max_results, 50, min_value=0, max_value=500),
+    }
+
+    result = services.revit_client.call_listener(
+        command_path="/elements/sync_parameters",
+        method="POST",
+        payload_data=payload,
+    )
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/sync_parameters"):
+        return {
+            "status": "error",
+            "error_type": "route_not_defined",
+            "message": "The active Revit route set does not support '/elements/sync_parameters'. Reload/update the Revit extension to enable parameter sync.",
+        }
+
+    if result.get("status") == "success":
+        if result_handle:
+            result["result_handle"] = result_handle
+        if record:
+            result["source_record"] = {
+                "storage_key": record.get("storage_key"),
+                "category": record.get("category"),
+                "count": record.get("count"),
+            }
+        result["parameter_resolution"] = resolution
+
+    return services.result_store.compact_result_payload(result)
+
+
 def build_element_tools() -> list[ToolDefinition]:
     return [
         ToolDefinition(
@@ -1653,6 +1917,42 @@ def build_element_tools() -> list[ToolDefinition]:
             handler=get_element_relationships_handler,
         ),
         ToolDefinition(
+            name=GET_ELEMENT_LOCATIONS_TOOL_NAME,
+            description=(
+                "Gets model-space XYZ locations for Revit elements. Uses LocationPoint, LocationCurve midpoint, "
+                "bounding-box center, and optional host/super-component fallback. Useful for overlap and duplicate "
+                "checks across scheduled element instances."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "include_bounding_box": {
+                        "type": "boolean",
+                        "description": "When true, returns bounding boxes and can use bbox centers as fallback locations. Default true.",
+                    },
+                    "include_fallbacks": {
+                        "type": "boolean",
+                        "description": "When true, uses direct host or super-component location if the source element has none. Default true.",
+                    },
+                    "rounding_precision_mm": {
+                        "type": "number",
+                        "description": "Millimeter tolerance used to emit XY/XYZ overlap keys. Default 1.0; use 0 to disable rounding keys.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based page offset into the resolved element list.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum source elements to process on this page.",
+                    },
+                },
+            },
+            handler=get_element_locations_handler,
+        ),
+        ToolDefinition(
             name=GET_RELATED_ELEMENT_PROPERTIES_TOOL_NAME,
             description=(
                 "Resolves each source element's host/super-component/host-chain parents and reads selected "
@@ -1731,5 +2031,63 @@ def build_element_tools() -> list[ToolDefinition]:
                 },
             },
             handler=update_element_parameters_handler,
+        ),
+        ToolDefinition(
+            name=SYNC_ELEMENT_PARAMETER_VALUES_TOOL_NAME,
+            description=(
+                "Synchronizes element parameter data by copying the first populated source parameter value into a "
+                "target parameter across explicit element_ids or a stored result_handle. Defaults to dry_run and "
+                "missing_only so existing target values are not overwritten unless target_policy is overwrite_all."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "source_parameters": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Ordered source parameter names. The first populated value is used.",
+                    },
+                    "target_parameter": {
+                        "type": "string",
+                        "description": "Parameter to write on each resolved element.",
+                    },
+                    "target_policy": {
+                        "type": "string",
+                        "enum": ["missing_only", "overwrite_all"],
+                        "description": "missing_only preserves existing target values. overwrite_all replaces every writable target value.",
+                    },
+                    "source_strategy": {
+                        "type": "string",
+                        "enum": ["first_populated"],
+                        "description": "How to choose source values. Currently only first_populated is supported.",
+                    },
+                    "conflict_policy": {
+                        "type": "string",
+                        "enum": ["use_first", "skip"],
+                        "description": "use_first writes the first populated source when multiple source parameters have values. skip leaves those elements unchanged.",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "When true, previews what would change without writing. Default true.",
+                    },
+                    "include_type_parameters": {
+                        "type": "boolean",
+                        "description": "When true, source parameters can fall back to the element type. Default true.",
+                    },
+                    "ignored_source_values": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Source display values to treat as blank, e.g. ['0', '0 mm'] for dimension cleanup.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum per-element records to include in results_sample. Default 50, max 500.",
+                    },
+                },
+                "required": ["source_parameters", "target_parameter"],
+            },
+            handler=sync_element_parameter_values_handler,
         ),
     ]
