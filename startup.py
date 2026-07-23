@@ -165,7 +165,8 @@ try:
             schema_routes,
             model_routes,
             element_operation_routes,
-            schedule_routes
+            schedule_routes,
+            tag_routes
         )
         logger.info("Route modules imported successfully")
         
@@ -190,6 +191,9 @@ try:
 
         schedule_routes.register_routes(api)
         logger.info("Schedule routes registered successfully")
+
+        tag_routes.register_routes(api)
+        logger.info("Tag routes registered successfully")
         
     except ImportError as ie:
         import_error_message = str(ie)
