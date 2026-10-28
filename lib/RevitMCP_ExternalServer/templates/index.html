@@ -31,8 +31,8 @@
       <label class="chat-search"><svg class="icon"><use href="#i-search"/></svg><input id="chat-search" type="search" placeholder="Search chats" aria-label="Search chats" autocomplete="off"></label>
       <div class="sidebar-label">Recent chats</div>
       <nav class="chat-history" id="chat-history" aria-label="Recent chats"></nav>
-      <p class="history-empty" id="history-empty">Your conversations will appear here.</p>
-      <div class="sidebar-bottom"><button class="sidebar-settings" id="settings-button"><svg class="icon"><use href="#i-settings"/></svg>Settings<span id="setup-dot" class="setup-dot" title="Add an API key"></span></button><span class="local-label">Saved in this browser</span></div>
+      <p class="history-empty" id="history-empty" hidden>No matching chats.</p>
+      <div class="sidebar-bottom"><button class="sidebar-settings" id="settings-button"><svg class="icon"><use href="#i-settings"/></svg>Settings</button></div>
     </aside>
     <button class="sidebar-backdrop" id="sidebar-backdrop" aria-label="Close chat sidebar" hidden></button>
     <main class="workspace">
@@ -46,7 +46,6 @@
         <section class="empty-state" id="empty-state" aria-label="Start a conversation">
           <div class="empty-mark"><svg><use href="#i-model"/></svg></div>
           <h2>What are you working on?</h2>
-          <p>Ask about your Revit model, or start here.</p>
           <div class="starter-list">
             <button data-prompt="Inspect the selected elements in Revit. Summarize their categories, families, and key parameters."><svg class="icon"><use href="#i-selection"/></svg><span>Inspect selected elements</span><span class="starter-plus">+</span></button>
             <button data-prompt="Help me find missing parameter values in my Revit model. First ask which category and parameters to check."><svg class="icon"><use href="#i-check"/></svg><span>Find missing parameter values</span><span class="starter-plus">+</span></button>
@@ -62,29 +61,24 @@
           <label class="sr-only" for="message-input">Message</label>
           <textarea id="message-input" rows="2" placeholder="Ask RevitMCP…" maxlength="32000"></textarea>
           <div class="composer-controls">
-            <label class="model-picker"><span class="sr-only">AI model</span><select id="model-selector" aria-label="AI model">
-              <optgroup label="OpenAI"><option value="gpt-5.4" data-provider="openai">GPT-5.4</option><option value="gpt-5.4-mini" data-provider="openai">GPT-5.4 mini</option></optgroup>
-              <optgroup label="Anthropic"><option value="claude-sonnet-4-6" data-provider="anthropic">Claude Sonnet 4.6</option><option value="claude-opus-4-6" data-provider="anthropic">Claude Opus 4.6</option><option value="claude-haiku-4-5" data-provider="anthropic">Claude Haiku 4.5</option></optgroup>
-              <optgroup label="Google"><option value="gemini-3.1-pro" data-provider="google">Gemini 3.1 Pro</option><option value="gemini-3.1-flash-lite" data-provider="google">Gemini 3.1 Flash-Lite</option></optgroup>
-              <optgroup label="Testing"><option value="echo_model" data-provider="echo">Echo test (no AI)</option></optgroup>
-            </select></label>
-            <button type="button" class="setup-link" id="setup-button">Connect AI</button>
+            <label class="model-picker"><span class="sr-only">AI model</span><select id="model-selector" aria-label="AI model"></select></label>
+            <button type="button" class="setup-link" id="setup-button">Add key</button>
             <button type="submit" class="send-button" id="send-button" aria-label="Send message" disabled><svg class="icon"><use href="#i-arrow"/></svg></button>
           </div>
         </form>
-        <div class="composer-footer"><span id="composer-status" role="status"></span><span class="keyboard-hint">Shift + Enter for a new line</span></div>
       </div>
     </main>
   </div>
   <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
     <form id="settings-form">
       <div class="dialog-heading"><h2 id="settings-title">Settings</h2><button type="button" class="icon-button" data-close="settings-dialog" aria-label="Close settings"><svg class="icon"><use href="#i-close"/></svg></button></div>
-      <p class="dialog-description">Add a key for the provider you use. Messages and model data go to that provider.</p>
-      <div class="provider-field"><label for="openai-api-key">OpenAI</label><input id="openai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="API key"></div>
-      <div class="provider-field"><label for="anthropic-api-key">Anthropic</label><input id="anthropic-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="API key"></div>
-      <div class="provider-field"><label for="google-api-key">Google</label><input id="google-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="API key"></div>
-      <div class="key-controls"><label><input id="show-keys" type="checkbox">Show keys</label><span>Keys are saved in this browser.</span></div>
-      <details class="custom-model"><summary>Use a custom model</summary><div class="custom-model-fields"><label for="custom-provider">Provider</label><select id="custom-provider"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option></select><label for="custom-model-id">Model ID</label><input id="custom-model-id" placeholder="Enter the provider’s model ID" autocomplete="off"><span>Leave blank to remove your custom model.</span></div></details>
+      <div class="provider-field"><label for="connection-selector">Connection</label><select id="connection-selector"><option value="openrouter">OpenRouter (recommended)</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option><option value="xai">xAI</option><option value="echo">Test (no AI)</option></select></div>
+      <div id="key-field">
+        <div class="key-label"><label for="provider-api-key">API key</label><div class="privacy-help" id="privacy-help"><button type="button" class="privacy-button" id="privacy-button" aria-label="Key privacy" aria-describedby="key-privacy">i</button><span id="key-privacy" class="privacy-tooltip" role="tooltip" hidden></span></div><a id="get-api-key" href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener noreferrer">Get a key</a></div>
+        <input id="provider-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="OpenRouter API key">
+        <div class="key-controls"><label><input id="show-keys" type="checkbox">Show key</label></div>
+      </div>
+      <details class="custom-model" id="custom-model"><summary>Custom model</summary><div class="custom-model-fields"><label for="custom-model-id">Model ID</label><input id="custom-model-id" placeholder="provider/model" autocomplete="off"></div></details>
       <p class="settings-feedback" id="settings-feedback" role="status"></p>
       <div class="dialog-actions"><button type="button" class="secondary-button" data-close="settings-dialog">Cancel</button><button type="submit" class="primary-button">Save settings</button></div>
     </form>
@@ -99,5 +93,6 @@
     <form id="chat-edit-form"><div class="dialog-heading"><h2 id="chat-dialog-title">Chat options</h2><button type="button" class="icon-button" data-close="chat-dialog" aria-label="Close chat options"><svg class="icon"><use href="#i-close"/></svg></button></div><label for="chat-name">Chat name</label><input id="chat-name" maxlength="100" required><div class="dialog-actions"><button type="button" class="text-danger" id="delete-chat">Delete chat</button><button type="submit" class="primary-button">Save name</button></div></form>
   </dialog>
   <div class="toast" id="toast" role="status" hidden><span id="toast-text"></span><button id="undo-delete" hidden>Undo</button></div>
+  <script id="ai-catalog" type="application/json">{{ model_catalog|tojson }}</script>
 </body>
 </html>

@@ -1,13 +1,14 @@
 from flask import jsonify, render_template, request
 
 from RevitMCP_ExternalServer.web.chat_service import run_chat_request
+from RevitMCP_ExternalServer.web.model_catalog import MODEL_CATALOG
 
 
 def register_routes(app, services, tool_registry) -> None:
     @app.route("/", methods=["GET"])
     def chat_ui():
         app.logger.info("Serving chat_ui (index.html)")
-        return render_template("index.html")
+        return render_template("index.html", model_catalog=MODEL_CATALOG)
 
     @app.route("/test_log", methods=["GET"])
     def test_log_route():
