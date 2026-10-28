@@ -135,8 +135,14 @@ The default Revit Routes port is usually `48884`.
 1.  Open a Revit project.
 2.  In Revit, click `RevitMCP -> Server -> Launch RevitMCP`.
 3.  Open `http://127.0.0.1:8000`.
-4.  Add any required model or API settings in the web UI.
-5.  Try: `Get Revit project info`
+4.  Open `Settings` and add an [OpenRouter API key](https://openrouter.ai/settings/keys) (recommended). You can also choose a direct OpenAI, Anthropic, Google, or xAI connection.
+5.  Choose a model below the message box. Try: `Get Revit project info`
+
+The header shows the last checked Revit connection, document, view, and selection. Refresh it after switching projects or views. Chat replies can show the tools used and exported Revit images. Chats and API keys are saved in this browser; exported images are not saved with chat history.
+
+The model picker includes GPT-6.1 Sol and Terra, GPT-6 Astra, Claude Opus 5.5, Fable 5.1 and Haiku 5.5, Gemini 3.8 Flash and 4 Argon, Kimi K3.1 Pro, GLM 5.3, and Grok 4.7. OpenRouter supports the full list with one key. Direct connections show that provider's models. A custom model ID can be set in Settings.
+
+Keys are sent through your RevitMCP server to the selected API, not stored in the project or chat history. OpenRouter and the selected model provider process requests; their [logging and retention policies](https://openrouter.ai/docs/guides/privacy/provider-logging) apply. The privacy tooltip beside the key field explains this path. This is not a local-only AI service.
 
 ## Share the Web UI on Your LAN
 

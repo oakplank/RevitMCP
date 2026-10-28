@@ -20,9 +20,9 @@ FALLBACK_LOG_BASE_DIR = os.path.join(tempfile.gettempdir(), "RevitMCP", "server_
 FALLBACK_CAPTURE_BASE_DIR = os.path.join(tempfile.gettempdir(), "RevitMCP", "captures")
 
 ANTHROPIC_MODEL_ID_MAP = {
-    "claude-sonnet-4-6": "claude-sonnet-4-6",
-    "claude-opus-4-6": "claude-opus-4-6",
-    "claude-haiku-4-5": "claude-haiku-4-5",
+    "claude-opus-5-5": "claude-opus-5-5",
+    "claude-fable-5-1": "claude-fable-5-1",
+    "claude-haiku-5-5": "claude-haiku-5-5",
 }
 
 
