@@ -23,6 +23,33 @@ def register_routes(app, services, tool_registry) -> None:
         )
         return jsonify(response_payload), status_code
 
+    @app.route("/revit_context", methods=["GET"])
+    def revit_context():
+        """Read the active document without starting a write transaction."""
+        result = services.revit_client.call_listener(
+            command_path="/diagnostics/revit_state",
+            method="POST",
+            payload_data={"check_write_context": False, "selection_limit": 0},
+        )
+        if not isinstance(result, dict) or result.get("status") != "success":
+            payload = {
+                "status": "disconnected",
+                "message": "Open Revit and enable pyRevit Routes, then refresh the connection.",
+            }
+        else:
+            document = result.get("document_state") or {}
+            view = result.get("active_view") or {}
+            selection = result.get("selection") or {}
+            payload = {
+                "status": "connected",
+                "document_name": document.get("title"),
+                "view_name": view.get("name") or document.get("active_view"),
+                "selection_count": selection.get("selected_count"),
+            }
+        response = jsonify(payload)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.route("/send_revit_command", methods=["POST"])
     def send_revit_command():
         client_request_data = request.json

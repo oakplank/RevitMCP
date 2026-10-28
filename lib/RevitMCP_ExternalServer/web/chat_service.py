@@ -3,6 +3,7 @@ from RevitMCP_ExternalServer.providers.google_provider import run_google_chat
 from RevitMCP_ExternalServer.providers.openai_provider import run_openai_chat
 from RevitMCP_ExternalServer.providers.types import ProviderResult
 from RevitMCP_ExternalServer.tools.planning_tools import build_planning_system_prompt
+from RevitMCP_ExternalServer.core.image_artifacts import load_image_artifact
 
 
 def _infer_provider_from_model_name(model_name: str) -> str:
@@ -45,7 +46,30 @@ def run_chat_request(
     )
     planning_system_prompt = build_planning_system_prompt(tool_registry, memory_context=memory_context)
 
-    execute_tool_call = lambda tool_name, function_args: tool_registry.dispatch(services, tool_name, function_args)
+    tool_calls = []
+    images = []
+
+    def collect_image(result):
+        if len(images) >= 3:
+            return
+        artifact = load_image_artifact(result, logger=services.logger)
+        if artifact:
+            images.append({"mime_type": artifact["mime_type"], "base64_data": artifact["base64_data"]})
+
+    def execute_tool_call(tool_name, function_args):
+        result = tool_registry.dispatch(services, tool_name, function_args)
+        if isinstance(result, dict):
+            tool_calls.append({
+                "name": tool_name,
+                "status": result.get("status") or result.get("final_status") or "finished",
+                "message": str(result.get("message") or result.get("summary") or "")[:400],
+            })
+            collect_image(result)
+            # Workflow results can contain view exports from individual steps.
+            for step in result.get("executed_steps", []) or []:
+                if isinstance(step, dict):
+                    collect_image(step.get("result"))
+        return result
 
     if selected_provider == "echo" or selected_model_ui_name == "echo_model":
         provider_result = ProviderResult(reply=f"Echo: {last_user_message}")
@@ -94,8 +118,13 @@ def run_chat_request(
         )
 
     response_payload = {"reply": provider_result.reply}
+    if tool_calls:
+        response_payload["tool_calls"] = tool_calls
+    if images:
+        response_payload["images"] = images
     if provider_result.error_detail and not provider_result.reply:
-        return {"error": provider_result.error_detail}, 500
+        response_payload["error"] = provider_result.error_detail
+        return response_payload, 500
     if provider_result.error_detail:
         response_payload["error_detail"] = provider_result.error_detail
     return response_payload, 200

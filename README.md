@@ -135,8 +135,10 @@ The default Revit Routes port is usually `48884`.
 1.  Open a Revit project.
 2.  In Revit, click `RevitMCP -> Server -> Launch RevitMCP`.
 3.  Open `http://127.0.0.1:8000`.
-4.  Add any required model or API settings in the web UI.
-5.  Try: `Get Revit project info`
+4.  Open `Settings` and add the API key for your AI provider.
+5.  Choose a model below the message box. Try: `Get Revit project info`
+
+The header shows the last checked Revit connection, document, view, and selection. Refresh it after switching projects or views. Chat replies can show the tools used and exported Revit images. Chats and API keys are saved in this browser; exported images are not saved with chat history.
 
 ## Share the Web UI on Your LAN
 
